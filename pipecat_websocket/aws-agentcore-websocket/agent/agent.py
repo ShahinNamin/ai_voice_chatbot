@@ -1,0 +1,201 @@
+#
+# Copyright (c) 2024–2025, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
+import os
+
+from bedrock_agentcore import BedrockAgentCoreApp
+from dotenv import load_dotenv
+from loguru import logger
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.runner import PipelineRunner
+from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.runner.types import RunnerArguments
+from pipecat.serializers.protobuf import ProtobufFrameSerializer
+from pipecat.services.aws.llm import AWSBedrockLLMService
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.transports.base_transport import BaseTransport
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
+from pipecat.services.aws.stt import AWSTranscribeSTTService
+from pipecat.services.aws.tts import AWSPollyTTSService
+
+app = BedrockAgentCoreApp()
+
+load_dotenv(override=True)
+
+
+async def fetch_weather_from_api(params: FunctionCallParams):
+    await params.result_callback({"conditions": "nice", "temperature": "75"})
+
+
+async def fetch_restaurant_recommendation(params: FunctionCallParams):
+    await params.result_callback({"name": "The Golden Dragon"})
+
+
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    logger.info(f"Starting bot")
+
+    # stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+
+    # tts = CartesiaTTSService(
+    #     api_key=os.getenv("CARTESIA_API_KEY"),
+    #     settings=CartesiaTTSService.Settings(
+    #         voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
+    #     ),
+    # )
+
+    stt = AWSTranscribeSTTService(
+            # api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            # aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+            # region=os.getenv("AWS_REGION")
+        )
+
+    tts = AWSPollyTTSService(
+            # api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            # aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+            # region=os.getenv("AWS_REGION"),
+            voice_id="Olivia",
+            params=AWSPollyTTSService.InputParams(
+                engine="neural",
+                language="en-AU",
+                rate="1.1"
+            )
+        )
+
+
+    # Automatically uses credentials from assumed IAM role when running in AgentCore
+    # Runtime, or from environment variables when running locally.
+    llm = AWSBedrockLLMService(
+        settings=AWSBedrockLLMService.Settings(
+            model="amazon.nova-pro-v1:0",
+            temperature=0.8,
+            system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
+        ),
+    )
+
+    # You can also register a function_name of None to get all functions
+    # sent to the same callback with an additional function_name parameter.
+    llm.register_function("get_current_weather", fetch_weather_from_api)
+    llm.register_function("get_restaurant_recommendation", fetch_restaurant_recommendation)
+
+    @llm.event_handler("on_function_calls_started")
+    async def on_function_calls_started(service, function_calls):
+        await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
+
+    weather_function = FunctionSchema(
+        name="get_current_weather",
+        description="Get the current weather",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+            "format": {
+                "type": "string",
+                "enum": ["celsius", "fahrenheit"],
+                "description": "The temperature unit to use. Infer this from the user's location.",
+            },
+        },
+        required=["location", "format"],
+    )
+    restaurant_function = FunctionSchema(
+        name="get_restaurant_recommendation",
+        description="Get a restaurant recommendation",
+        properties={
+            "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA",
+            },
+        },
+        required=["location"],
+    )
+    tools = ToolsSchema(standard_tools=[weather_function, restaurant_function])
+
+    context = LLMContext(tools=tools)
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+        ),
+    )
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            stt,
+            user_aggregator,
+            llm,
+            tts,
+            transport.output(),
+            assistant_aggregator,
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
+    )
+
+    @task.rtvi.event_handler("on_client_ready")
+    async def on_client_ready(rtvi):
+        logger.info(f"Client ready")
+        # Kick off the conversation
+        context.add_message(
+            {"role": "user", "content": "Say hello and briefly introduce yourself."}
+        )
+        await task.queue_frames([LLMRunFrame()])
+
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info(f"Client connected")
+
+    @transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        logger.info(f"Client disconnected")
+        await task.cancel()
+
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.run(task)
+
+
+@app.websocket
+async def agentcore_bot(websocket, context):
+    """Bot entry point for running on Amazon Bedrock AgentCore Runtime."""
+    await websocket.accept()
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            serializer=ProtobufFrameSerializer(),
+        ),
+    )
+
+    await run_bot(transport, RunnerArguments())
+
+
+if __name__ == "__main__":
+    # Running on AgentCore Runtime
+    app.run()
