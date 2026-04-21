@@ -2,7 +2,7 @@
 import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
 
 const ddb = new DynamoDBClient({});
-const TABLE_NAME = "connect_chime_call_metadata";
+const TABLE_NAME = process.env.METADATA_TABLE;
 
 export const handler = async (event) => {
   console.log("Connect event:", JSON.stringify(event));
