@@ -12,7 +12,7 @@ Responsibilities:
 
 Environment variables:
   SESSIONS_TABLE         – DynamoDB table name for active call sessions
-  KINESIS_STREAM_ARN     – ARN of the Kinesis Video Stream to bridge calls to
+  VOICE_CONNECTOR_ARN    – ARN of the Voice connector to bridge calls to
 """
 
 import json
@@ -29,7 +29,7 @@ logger.setLevel(logging.INFO)
 dynamo = boto3.client("dynamodb")
 
 SESSIONS_TABLE     = os.environ["SESSIONS_TABLE"]
-KINESIS_STREAM_ARN = os.environ["KINESIS_STREAM_ARN"]
+VOICE_CONNECTOR_ARN = os.environ["VOICE_CONNECTOR_ARN"]
 
 
 # ---------------------------------------------------------------------------
@@ -106,39 +106,39 @@ def handle_new_call(event, transaction_id, call_id, call_details, time_stamp    
                     "VoiceId":      "Olivia",
                 },
             },
-            # 3. Call and Bridge to the audio connector (Kinesis Video Stream)
-            # {
-            #     "Type": "CallAndBridge",
-            #     "Parameters": {
-            #         "CallTimeoutSeconds": 30,
-            #         "CallerIdNumber": caller_number,
-            #         "Endpoints": [
-            #             {
-            #                 "BridgeEndpointType": "AWS",
-            #                 "Arn": AUDIO_CONNECTOR_ARN,
-            #                 "Uri": f"{call_id[-20:]}_{caller_number.replace('+', '')}",  # Unique SIP URI for this call
-            #             }
-            #         ],
-            #         # Attach the inbound call leg to the bridge
-            #         "CallId": call_id,
-            #         },
-            # }
+            3. Call and Bridge to the audio connector (Kinesis Video Stream)
             {
-                "Type": "StartMediaStreamingPipeline",
+                "Type": "CallAndBridge",
                 "Parameters": {
-                    "Streams": [
+                    "CallTimeoutSeconds": 30,
+                    "CallerIdNumber": caller_number,
+                    "Endpoints": [
                         {
-                            "Type": "MixedAudio",
-                            "Destination": {
-                                "Type":        "KinesisVideoStream",
-                                "ResourceArn": KINESIS_STREAM_ARN,
-                            },
+                            "BridgeEndpointType": "AWS",
+                            "Arn": VOICE_CONNECTOR_ARN,
+                            "Uri": f"{call_id[-20:]}_{caller_number.replace('+', '')}",  # Unique SIP URI for this call
                         }
                     ],
-                    "MediaEncoding":         "pcm",  # 16-bit PCM
-                    "MediaSampleRateHertz":  8000,   # 8 kHz telephony standard
-                },
-            },
+                    # Attach the inbound call leg to the bridge
+                    "CallId": call_id,
+                    },
+            }
+            # {
+            #     "Type": "StartMediaStreamingPipeline",
+            #     "Parameters": {
+            #         "Streams": [
+            #             {
+            #                 "Type": "MixedAudio",
+            #                 "Destination": {
+            #                     "Type":        "KinesisVideoStream",
+            #                     "ResourceArn": KINESIS_STREAM_ARN,
+            #                 },
+            #             }
+            #         ],
+            #         "MediaEncoding":         "pcm",  # 16-bit PCM
+            #         "MediaSampleRateHertz":  8000,   # 8 kHz telephony standard
+            #     },
+            # },
         ],
     }
 
