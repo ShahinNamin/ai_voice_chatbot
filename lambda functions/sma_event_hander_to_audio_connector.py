@@ -106,7 +106,7 @@ def handle_new_call(event, transaction_id, call_id, call_details, time_stamp    
                     "VoiceId":      "Olivia",
                 },
             },
-            3. Call and Bridge to the audio connector (Kinesis Video Stream)
+            # 3. Call and Bridge to the audio connector (Kinesis Video Stream)
             {
                 "Type": "CallAndBridge",
                 "Parameters": {
