@@ -31,6 +31,8 @@ from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
+import boto3
+
 
 app = BedrockAgentCoreApp()
 
@@ -48,6 +50,15 @@ async def fetch_restaurant_recommendation(params: FunctionCallParams):
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
 
+    session= boto3.Session()
+    credentials = session.get_credentials() 
+    credentials= credentials.get_frozen_credentials()
+    access_key = credentials.access_key
+    secret_key = credentials.secret_key
+    session_token = credentials.token
+    region =  session.region_name
+
+
     # stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
     # tts = CartesiaTTSService(
@@ -58,22 +69,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # )
 
     stt = AWSTranscribeSTTService(
-            # api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            # aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
-            # region=os.getenv("AWS_REGION")
+            api_key=access_key,
+            aws_access_key_id=secret_key,
+            aws_session_token=session_token,
+            region=region
         )
 
     tts = AWSPollyTTSService(
-            # api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-            # aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
-            # region=os.getenv("AWS_REGION"),
-            voice_id="Olivia",
-            params=AWSPollyTTSService.InputParams(
+            api_key=access_key,
+            aws_access_key_id=secret_key,
+            aws_session_token=session_token,
+            region=region,
+            settings=AWSPollyTTSService.Settings(
+            voice="Olivia",
                 engine="neural",
                 language="en-AU",
-                rate="1.1"
+                rate="100%"
             )
         )
 
@@ -181,6 +192,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 @app.websocket
 async def agentcore_bot(websocket, context):
     """Bot entry point for running on Amazon Bedrock AgentCore Runtime."""
+    print("agentcore bot called")
     await websocket.accept()
 
     transport = FastAPIWebsocketTransport(

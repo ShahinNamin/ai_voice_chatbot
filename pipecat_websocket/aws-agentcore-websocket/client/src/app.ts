@@ -189,8 +189,8 @@ class WebsocketClientApp {
       this.log("Connecting to bot...");
       await this.pcClient.startBotAndConnect({
         // The baseURL and endpoint of your bot server that the client will connect to
-        // endpoint: "http://localhost:7860/start",
-        endpoint: "http://https://uwtolgz5efyltdl.studio.ap-southeast-2.sagemaker.aws/codeeditor/default/ports/7860/start"
+        endpoint: "http://3.91.107.118:7860/start",
+        // endpoint: "/start"
       });
 
       const timeTaken = Date.now() - startTime;
