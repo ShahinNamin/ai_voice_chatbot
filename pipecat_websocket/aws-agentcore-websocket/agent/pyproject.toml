@@ -5,6 +5,6 @@ description = "Pipecat bot agent for Amazon Bedrock AgentCore"
 requires-python = ">=3.11"
 dependencies = [
     "bedrock-agentcore",
-    "pipecat-ai[aws,cartesia,daily,deepgram,runner,silero,websocket,local-smart-turn-v3,transformer]",
+    "pipecat-ai[aws,cartesia,daily,deepgram,runner,silero,websocket,local-smart-turn-v3,transformers]",
     "boto3"
 ]

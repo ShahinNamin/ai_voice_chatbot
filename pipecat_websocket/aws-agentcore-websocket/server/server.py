@@ -8,6 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 from urllib.parse import quote
+import boto3
 
 import uvicorn
 from botocore.auth import SigV4QueryAuth
@@ -54,11 +55,19 @@ async def start_bot(request: Request) -> Dict[Any, Any]:
     # Get required environment variables.
     # NOTE: For production, consider using a credential provider that automatically
     # refreshes temporary credentials instead of env vars.
-    access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
-    secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    session_token = os.getenv("AWS_SESSION_TOKEN")  # Optional, for temporary credentials
+    
+    session= boto3.Session()
+    credentials = session.get_credentials() 
+    credentials= credentials.get_frozen_credentials()
+    access_key_id = credentials.access_key
+    secret_access_key = credentials.secret_key
+    session_token = credentials.token
+    region =  os.getenv("AWS_REGION")
     agent_runtime_arn = os.getenv("AGENT_RUNTIME_ARN")
-    region = os.getenv("AWS_REGION")
+
+    print(access_key_id)
+
+    print(agent_runtime_arn)
 
     if not access_key_id or not secret_access_key or not agent_runtime_arn or not region:
         raise HTTPException(
