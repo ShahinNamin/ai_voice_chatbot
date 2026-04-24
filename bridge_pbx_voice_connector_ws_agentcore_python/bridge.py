@@ -377,30 +377,29 @@ class CallSession:
 
 # ── Pipecat protobuf frame codec ─────────────────────────────────────────────
 #
-# AgentCore uses pipecat-ai's protobuf wire format (frames.proto).
-# We hand-roll the minimal encode/decode needed to avoid a compiled-proto dep.
+# Hand-rolled protobuf matching Pipecat 1.0.0 frames_pb2 schema exactly:
 #
-# Relevant proto schema (pipecat-ai/src/pipecat/frames/frames.proto):
+#   Frame (oneof "frame"):
+#     field 1 = text        { id, name, text }
+#     field 2 = audio       { id, name, audio(bytes), sample_rate, num_channels, pts }
+#     field 3 = transcription
+#     field 4 = message     { data(string) }  ← RTVI JSON
 #
-#   message Frame {
-#     oneof frame {
-#       AudioRawFrame       audio_raw_frame       = 4;  // agent → bridge (outbound TTS)
-#       InputAudioRawFrame  input_audio_raw_frame = 5;  // bridge → agent (inbound mic)
-#     }
-#   }
-#   message AudioRawFrame      { bytes audio=1; uint32 sample_rate=2; uint32 num_channels=3; }
-#   message InputAudioRawFrame { bytes audio=1; uint32 sample_rate=2; uint32 num_channels=3; }
+# We do NOT use pipecat's Python package on the bridge EC2 because it requires
+# Python 3.10+ (uses str|None syntax) and the bridge runs Python 3.9.
+# The hand-rolled encoding below matches the wire format exactly.
+
+_PIPECAT_AVAILABLE = False   # always use hand-rolled on bridge (Python 3.9)
+
+# ── hand-rolled protobuf ──────────────────────────────────────────────────────
 
 def _encode_varint(value: int) -> bytes:
     out = []
     while True:
         bits = value & 0x7F
         value >>= 7
-        if value:
-            out.append(bits | 0x80)
-        else:
-            out.append(bits)
-            break
+        out.append(bits | 0x80 if value else bits)
+        if not value: break
     return bytes(out)
 
 def _decode_varint(data: bytes, pos: int):
@@ -408,8 +407,7 @@ def _decode_varint(data: bytes, pos: int):
     while pos < len(data):
         b = data[pos]; pos += 1
         result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            break
+        if not (b & 0x80): break
         shift += 7
     return result, pos
 
@@ -421,25 +419,38 @@ def _varint_field(field_num: int, value: int) -> bytes:
 
 
 def pack_audio(pcm16: bytes, sample_rate: int = AGENT_SAMPLE_RATE) -> bytes:
-    """Encode PCM16 as Frame { input_audio_raw_frame: InputAudioRawFrame{...} }."""
-    inner = (
-        _len_field(1, pcm16) +
-        _varint_field(2, sample_rate) +
-        _varint_field(3, 1)           # num_channels = 1
-    )
-    return _len_field(5, inner)       # Frame field 5 = input_audio_raw_frame
+    """Encode PCM16 as Frame { audio { audio=pcm, sample_rate=sr, num_channels=1 } }.
 
-
-def unpack_audio(data: bytes):
+    Matches Pipecat 1.0.0 frames_pb2 schema:
+      Frame.audio (field 2):
+        field 3 = audio bytes
+        field 4 = sample_rate (varint)
+        field 5 = num_channels (varint)
+    Fields 1(id), 2(name), 6(pts) are optional and omitted.
     """
-    Decode Frame { audio_raw_frame: AudioRawFrame{...} } → (pcm16, sample_rate).
-    Returns None if the frame is not an AudioRawFrame (e.g. text/control frames).
+    safe_sr = sample_rate if sample_rate and sample_rate > 0 else AGENT_SAMPLE_RATE
+    inner = (
+        _len_field(3, pcm16) +
+        _varint_field(4, safe_sr) +
+        _varint_field(5, 1)
+    )
+    return _len_field(2, inner)
 
-    Pipecat proto field map (frames.proto):
-      Frame.audio_raw_frame       = field 4   (agent TTS output → we send to RTP)
-      Frame.input_audio_raw_frame = field 5   (our mic input → we send TO agent)
-      Frame.text_frame            = field 2   (transcript/control JSON)
-      Frame.llm_full_response     = field 14  (text control)
+
+async def pack_audio_async(pcm16: bytes, sample_rate: int = AGENT_SAMPLE_RATE) -> bytes:
+    """Async wrapper — pack_audio is synchronous but callers use await."""
+    return pack_audio(pcm16, sample_rate)
+
+
+async def unpack_audio_async(data: bytes):
+    """Decode Frame { audio { ... } } → (pcm16, sample_rate).
+
+    Matches Pipecat 1.0.0 frames_pb2 schema:
+      Frame.audio (field 2):
+        field 3 = audio bytes
+        field 4 = sample_rate (varint)
+        field 5 = num_channels (varint)
+    Returns None if the frame is not an audio frame.
     """
     pos = 0
     while pos < len(data):
@@ -447,15 +458,10 @@ def unpack_audio(data: bytes):
         fn = tag >> 3; wt = tag & 7
         if wt == 2:
             ln, pos = _decode_varint(data, pos)
-            payload  = data[pos:pos+ln]; pos += ln
-            if fn == 4:                # audio_raw_frame — TTS audio from agent
-                return _decode_audio_inner(payload)
-            if fn == 2:                # text_frame — log as ctrl
-                try:
-                    log.debug("WS frame: text_frame(field2) = %s", payload.decode("utf-8", errors="replace")[:200])
-                except Exception:
-                    pass
-            # other length-delimited fields: skip
+            payload = data[pos:pos+ln]; pos += ln
+            if fn == 2:   # Frame.audio
+                return _decode_pipecat_audio_frame(payload)
+            # fn==4 is message (RTVI control) — skip silently
         elif wt == 0:
             _, pos = _decode_varint(data, pos)
         elif wt == 5:
@@ -467,8 +473,10 @@ def unpack_audio(data: bytes):
     return None
 
 
-def _decode_audio_inner(data: bytes):
-    """Decode AudioRawFrame → (audio_bytes, sample_rate)."""
+def _decode_pipecat_audio_frame(data: bytes):
+    """Decode Pipecat 1.0.0 AudioFrame inner fields → (audio_bytes, sample_rate).
+    Schema: field1=id, field2=name, field3=audio(bytes), field4=sample_rate, field5=num_channels
+    """
     audio = b""; sr = AGENT_SAMPLE_RATE
     pos = 0
     while pos < len(data):
@@ -477,14 +485,19 @@ def _decode_audio_inner(data: bytes):
         if wt == 2:
             ln, pos = _decode_varint(data, pos)
             val = data[pos:pos+ln]; pos += ln
-            if fn == 1: audio = val
+            if fn == 3: audio = val        # field 3 = audio bytes
         elif wt == 0:
             v, pos = _decode_varint(data, pos)
-            if fn == 2: sr = v
+            if fn == 4: sr = v             # field 4 = sample_rate
         elif wt == 5: pos += 4
         elif wt == 1: pos += 8
         else: break
     return audio, sr
+
+
+def _decode_audio_inner(data: bytes):
+    """Alias for compatibility."""
+    return _decode_pipecat_audio_frame(data)
 
 
 # ── Core bridge ───────────────────────────────────────────────────────────────
@@ -784,30 +797,35 @@ class PbxBridge:
 
                 # ── RTVI handshake ────────────────────────────────────────────
                 # FastAPIWebsocketTransport with ProtobufFrameSerializer uses
-                # the RTVI protocol. On connect the server sends a bot-ready
-                # TransportMessageFrame. The client must respond with a
-                # client-ready TransportMessageFrame before the pipeline
-                # activates and audio starts flowing.
+                # the RTVI protocol:
                 #
-                # Frame { transport_message_frame(field4) {
-                #   message(field1): '{"label":"rtvi-ai","type":"client-ready","id":"1"}'
-                # }}
-                try:
-                    client_ready_json = json.dumps({
-                        "label": "rtvi-ai",
-                        "type":  "client-ready",
-                        "id":    "1",
-                    }).encode()
-                    inner = _len_field(1, client_ready_json)
-                    client_ready_frame = _len_field(4, inner)
-                    await ws.send(client_ready_frame)
-                    log.info("RTVI client-ready sent  call-id=%.36s", call_id)
-                except Exception as e:
-                    log.warning("RTVI client-ready failed: %s  call-id=%.36s", e, call_id)
+                # 1. Server sends bot-ready as a binary protobuf
+                #    TransportMessageFrame (field 4, inner field 1 = JSON).
+                # 2. Client must respond with client-ready in the SAME format
+                #    (binary protobuf field 4, inner field 1 = JSON).
+                # 3. The client-ready MUST be sent AFTER the bot-ready is
+                #    received — sending it immediately on connect causes it to
+                #    arrive before Pipecat's StartFrame has propagated through
+                #    the pipeline, so RTVIProcessor drops it silently.
+                #
+                # Build the client-ready frame once (reused in the receive loop).
+                # Use Pipecat's TransportMessageFrame if available, else hand-roll.
+                _cr_json = json.dumps({
+                    "label":   "rtvi-ai",
+                    "type":    "client-ready",
+                    "id":      "1",
+                    "data":    {"version": "1.2.0"},
+                })
+                # Frame { message { data: json_string } }
+                # field 4 = message, inner field 1 = data (the JSON string)
+                _cr_inner = _len_field(1, _cr_json.encode())
+                _client_ready_frame = _len_field(4, _cr_inner)
+                _client_ready_sent = False
 
                 await asyncio.gather(
                     self._rtp_to_ws(session, stop),
-                    self._ws_to_rtp(session, stop),
+                    self._ws_to_rtp(session, stop,
+                                    client_ready_frame=_client_ready_frame),
                 )
                 log.info("Both media loops exited  call-id=%.36s", call_id)
 
@@ -950,7 +968,7 @@ class PbxBridge:
                 pcm16 = session.pcm8k_to_16k(pcm8)
 
                 try:
-                    await session.ws.send(pack_audio(pcm16))
+                    await session.ws.send(await pack_audio_async(pcm16))
                 except websockets.exceptions.ConnectionClosed as e:
                     log.warning("RTP→WS: WS closed while sending  code=%s reason='%s'  call-id=%.36s",
                                 e.code, e.reason, session.call_id)
@@ -967,10 +985,55 @@ class PbxBridge:
 
     # ── WebSocket → RTP ───────────────────────────────────────────────────────
 
-    async def _ws_to_rtp(self, session: CallSession, stop: asyncio.Event):
+    async def _ws_to_rtp(self, session: CallSession, stop: asyncio.Event,
+                          client_ready_frame: bytes = b""):
         log.info("WS→RTP started  call-id=%.36s", session.call_id)
         ws_frames_rx = 0
         rtp_packets_tx = 0
+        client_ready_sent = False
+
+        # RTP output queue with precise 20ms pacing.
+        # The Pipecat/Polly pipeline sends 40ms audio frames (1920 bytes at 24kHz
+        # = 4 RTP packets after resampling). Sending all 4 packets instantly
+        # causes a burst every 40ms which sounds choppy on the phone.
+        # This task drains the queue at exactly one packet per 20ms using
+        # a monotonic clock, smoothing the stream into a steady cadence.
+        import time as _time
+        rtp_out_queue: asyncio.Queue = asyncio.Queue(maxsize=400)
+        PACKET_INTERVAL = CHIME_FRAME_MS / 1000.0  # 0.020s
+
+        async def _rtp_output_task():
+            next_tx = _time.monotonic()
+            while not stop.is_set():
+                # Wait for next packet slot
+                now = _time.monotonic()
+                wait = next_tx - now
+                if wait > 0.001:
+                    await asyncio.sleep(wait)
+                elif wait < -0.100:
+                    # More than 5 frames behind — resync clock
+                    next_tx = _time.monotonic()
+
+                try:
+                    chunk = rtp_out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    # No audio ready — advance clock and try again
+                    next_tx += PACKET_INTERVAL
+                    continue
+
+                pkt = session.next_rtp_header() + chunk
+                try:
+                    session.rtp_socket.sendto(
+                        pkt, (session.remote_host, session.remote_rtp_port)
+                    )
+                except OSError as e:
+                    log.warning("WS→RTP output task: sendto failed: %s", e)
+
+                next_tx += PACKET_INTERVAL
+
+        rtp_output_task = asyncio.create_task(_rtp_output_task())
+
+
 
         try:
             async for message in session.ws:
@@ -979,14 +1042,33 @@ class PbxBridge:
 
                 if isinstance(message, bytes):
                     ws_frames_rx += 1
-                    if ws_frames_rx == 1:
-                        log.info("WS→RTP: first binary frame  %d bytes  header=%s  call-id=%.36s",
-                                 len(message), message[:12].hex(), session.call_id)
-                    elif ws_frames_rx <= 5:
-                        log.debug("WS→RTP: frame #%d  %d bytes  header=%s  call-id=%.36s",
-                                  ws_frames_rx, len(message), message[:12].hex(), session.call_id)
+                    # Log all frames, but only dump full hex for first 3 audio frames
+                    outer_field = (message[0] >> 3) if message else 0
+                    if outer_field == 2:  # audio frame
+                        audio_frame_count = getattr(session, '_audio_frame_count', 0) + 1
+                        session._audio_frame_count = audio_frame_count
+                        if audio_frame_count <= 3:
+                            log.info("WS AUDIO FRAME #%d  %d bytes  full_hex=%s  call-id=%.36s",
+                                     audio_frame_count, len(message), message.hex(), session.call_id)
+                    elif ws_frames_rx <= 10:
+                        log.info("WS CTRL FRAME #%d  %d bytes  call-id=%.36s",
+                                 ws_frames_rx, len(message), session.call_id)
 
-                    result = unpack_audio(message)
+                    # ── RTVI handshake: send client-ready after bot-ready ──────
+                    # The first frame from the server is always the bot-ready
+                    # TransportMessageFrame. Once we receive it the pipeline's
+                    # StartFrame has propagated and RTVIProcessor is ready.
+                    if not client_ready_sent and client_ready_frame:
+                        try:
+                            await session.ws.send(client_ready_frame)
+                            client_ready_sent = True
+                            log.info("RTVI client-ready sent (after bot-ready)  call-id=%.36s",
+                                     session.call_id)
+                        except Exception as e:
+                            log.warning("RTVI client-ready send failed: %s  call-id=%.36s",
+                                        e, session.call_id)
+
+                    result = await unpack_audio_async(message)
                     if result is None:
                         # Not an AudioRawFrame — log first few occurrences then silence
                         if ws_frames_rx <= 5:
@@ -998,35 +1080,71 @@ class PbxBridge:
                     if not pcm16:
                         continue
 
-                    # audioop.ratecv requires an even byte count (2 bytes per PCM16 sample).
-                    # AgentCore may return an odd-length buffer — drop the stray byte.
+                    # Sanity-check: real PCM16 audio frames are at minimum a few
+                    # hundred bytes. Pipecat control/JSON frames get mis-decoded as
+                    # "audio" because they share field numbers with AudioRawFrame.
+                    # A 20ms frame at 8kHz=320B, 16kHz=640B, 24kHz=960B.
+                    # Anything under 200 bytes is almost certainly a control frame.
+                    # Also reject frames whose content looks like printable ASCII
+                    # (JSON text) rather than binary PCM data.
+                    if len(pcm16) < 200:
+                        log.debug("WS→RTP: skipping tiny pseudo-audio frame  "
+                                  "pcm_bytes=%d  sr=%d  likely control JSON  call-id=%.36s",
+                                  len(pcm16), agent_sr, session.call_id)
+                        continue
+
+                    # Check if content looks like JSON/text rather than binary PCM
+                    printable = sum(32 <= b < 127 for b in pcm16[:32])
+                    if printable > 24:   # >75% printable = almost certainly text
+                        log.debug("WS→RTP: skipping text-like pseudo-audio frame  "
+                                  "pcm_bytes=%d  call-id=%.36s", len(pcm16), session.call_id)
+                        continue
+
+                    # Log sample rate on first real audio frame
+                    if rtp_packets_tx == 0:
+                        log.info("WS→RTP: first REAL audio frame  pcm_bytes=%d  sample_rate=%d  call-id=%.36s",
+                                 len(pcm16), agent_sr, session.call_id)
+
+                    # audioop.ratecv requires an even byte count
                     if len(pcm16) % 2:
                         pcm16 = pcm16[:-1]
                     if not pcm16:
                         continue
 
-                    if agent_sr and agent_sr != AGENT_SAMPLE_RATE:
-                        log.debug("WS→RTP: agent sr=%d (expected %d)", agent_sr, AGENT_SAMPLE_RATE)
-                    pcm8 = session.pcm16k_to_8k(pcm16)
+                    # Resample from agent sample rate to 8kHz for G.711 RTP.
+                    # Reset resampler state when sample rate changes.
+                    src_rate = agent_sr if agent_sr and agent_sr > 0 else AGENT_SAMPLE_RATE
+                    if not hasattr(session, '_ws_src_rate') or session._ws_src_rate != src_rate:
+                        session._ws_src_rate = src_rate
+                        session._ws_rs_state = None
+                        log.info("WS→RTP: resampler reset  src=%dHz→8kHz  call-id=%.36s",
+                                 src_rate, session.call_id)
+                    if src_rate != CHIME_SAMPLE_RATE:
+                        pcm8, session._ws_rs_state = audioop.ratecv(
+                            pcm16, 2, 1, src_rate, CHIME_SAMPLE_RATE, session._ws_rs_state
+                        )
+                    else:
+                        pcm8 = pcm16
+
                     encoded = (
                         audioop.lin2alaw(pcm8, 2)
                         if session.payload_type == RTP_PAYLOAD_PCMA
                         else audioop.lin2ulaw(pcm8, 2)
                     )
 
+                    # Push encoded G711 chunks into the RTP output queue.
+                    # The _rtp_output_task drains this queue with precise 20ms pacing
+                    # using a monotonic clock, ensuring packets arrive at Chime
+                    # at a steady cadence regardless of asyncio scheduling jitter.
                     for i in range(0, len(encoded), CHIME_FRAME_SAMPLES):
                         chunk = encoded[i : i + CHIME_FRAME_SAMPLES]
                         if not chunk:
                             break
-                        pkt = session.next_rtp_header() + chunk
-                        try:
-                            session.rtp_socket.sendto(
-                                pkt, (session.remote_host, session.remote_rtp_port)
-                            )
-                            rtp_packets_tx += 1
-                            session.suppress_keepalive = True
-                        except OSError as e:
-                            log.warning("WS→RTP: RTP sendto failed: %s", e)
+                        if len(chunk) < CHIME_FRAME_SAMPLES:
+                            chunk = chunk + bytes(CHIME_FRAME_SAMPLES - len(chunk))
+                        await rtp_out_queue.put(chunk)
+                        rtp_packets_tx += 1
+                        session.suppress_keepalive = True
 
                 elif isinstance(message, str):
                     # Control / transcript frames — always log at INFO so we see agent events
@@ -1040,8 +1158,12 @@ class PbxBridge:
         except Exception as e:
             log.error("WS→RTP: unexpected error  call-id=%.36s : %s", session.call_id, e, exc_info=True)
         finally:
-            log.info("WS→RTP ended  call-id=%.36s  ws_frames_rx=%d  rtp_packets_tx=%d  "
-                     "(if rtp_packets_tx=0: agent sent no AudioRawFrame field-4 frames)",
+            rtp_output_task.cancel()
+            try:
+                await rtp_output_task
+            except asyncio.CancelledError:
+                pass
+            log.info("WS→RTP ended  call-id=%.36s  ws_frames_rx=%d  rtp_packets_tx=%d",
                      session.call_id, ws_frames_rx, rtp_packets_tx)
             stop.set()   # signal _rtp_to_ws to exit too
 

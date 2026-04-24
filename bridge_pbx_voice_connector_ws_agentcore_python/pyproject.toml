@@ -1,3 +1,4 @@
+
 [project]
 name = "bridge-pbx-voice-connector-ws-agentcore-python"
 version = "0.1.0"
@@ -7,6 +8,8 @@ requires-python = ">=3.9"
 dependencies = [
     "boto3>=1.42.95",
     "botocore>=1.42.95",
+    "pipecat>=0.3.0",
+    "pipecat-ai>=0.0.36",
     "python-dotenv>=1.2.1",
     "websockets>=15.0.1",
 ]
