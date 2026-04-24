@@ -55,6 +55,16 @@ export class BridgeServer {
     // Start SIP server
     await this.sipServer.start();
 
+    // Register with and send OPTIONS keepalives to Chime Voice Connector.
+    // Chime requires REGISTER before it will complete ACK handshakes (same as Asterisk).
+    const chimeVcHost = process.env.CHIME_VC_HOST;
+    if (chimeVcHost) {
+      this.sipServer.startRegistration(chimeVcHost);
+      this.sipServer.startOptionsKeepalive(chimeVcHost);
+    } else {
+      logger.warn("CHIME_VC_HOST not set — SIP registration and keepalives disabled");
+    }
+
     // Start HTTP health server
     await this.startHttpServer();
 

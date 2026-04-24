@@ -1,0 +1,16 @@
+# PBX Bridge – Python dependencies
+# Install with: pip install -r requirements.txt
+
+# AWS SDK
+boto3>=1.34.0
+botocore>=1.34.0
+
+# WebSocket client
+websockets>=12.0
+
+# Env file support (optional – EC2/ECS roles are preferred)
+python-dotenv>=1.0.0
+
+# Async HTTP (used only if you extend the bridge with an HTTP health endpoint)
+# fastapi>=0.110.0
+# uvicorn>=0.29.0

@@ -195,7 +195,11 @@ export function buildSipResponse(opts: SipResponseOptions): string {
   );
 
   if (contact) {
-    lines.push(`Contact: <sip:${localIp}:${localPort}>`);
+    // Include the request-URI user part and transport=UDP in Contact
+    // so Chime knows exactly where to send the ACK
+    const toMatch = request.requestUri?.match(/sip:([^@;>]+)/);
+    const userPart = toMatch ? toMatch[1] + "@" : "";
+    lines.push(`Contact: <sip:${userPart}${localIp}:${localPort};transport=UDP>`);
   }
 
   if (body && contentType) {

@@ -14,6 +14,7 @@
  */
 
 import * as dgram from "dgram";
+
 import * as os from "os";
 import EventEmitter = require("events");
 import {
@@ -27,6 +28,9 @@ import { parseSdp, buildSdpAnswer } from "./sdp";
 import { CallSession } from "./callSession";
 import { RtpPortManager } from "./rtpPortManager";
 import { logger } from "./logger";
+
+// Declare require for CommonJS interop (minimal @types/node doesn't include it)
+declare const require: (mod: string) => any; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 // ─── Internal call state ─────────────────────────────────────────────────────
 
@@ -42,6 +46,8 @@ interface PendingCall {
 
 export class SipServer extends EventEmitter {
   private socket: dgram.Socket;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private tcpServer: any = null;
   private readonly sipPort: number;
   private localIp: string;
   private readonly portManager: RtpPortManager;
@@ -66,15 +72,20 @@ export class SipServer extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    await this.startUdp();
+    await this.startTcp();
+  }
+
+  private startUdp(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.socket.on("error", (err) => {
-        logger.error("SIP socket error", err);
+        logger.error("SIP UDP socket error", err);
         reject(err);
       });
 
       this.socket.on("message", (msg, rinfo) => {
         const raw = msg.toString("utf8");
-        logger.debug(`SIP ← ${rinfo.address}:${rinfo.port}\n${raw.slice(0, 300)}`);
+        logger.debug(`SIP UDP ← ${rinfo.address}:${rinfo.port}\n${raw.slice(0, 300)}`);
         this.handleMessage(raw, rinfo.address, rinfo.port);
       });
 
@@ -84,6 +95,23 @@ export class SipServer extends EventEmitter {
       });
     });
   }
+
+  private async startTcp(): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-var-requires
+    const { startTcpSipServer } = require("./tcpServer") as any;
+    this.tcpServer = await startTcpSipServer(
+      this.sipPort,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (msg: string, remoteIp: string, remotePort: number, tcpSend: (data: string) => void) => {
+        logger.debug(`SIP TCP ← ${remoteIp}:${remotePort}\n${msg.slice(0, 300)}`);
+        // Pass tcpSend so responses go back on the same TCP socket
+        this.handleMessage(msg, remoteIp, remotePort, tcpSend);
+      },
+      (err: Error) => logger.error("SIP TCP server error", err)
+    );
+    logger.info(`SIP server listening on TCP port ${this.sipPort}`);
+  }
+
 
   stop(): void {
     try {
@@ -99,7 +127,8 @@ export class SipServer extends EventEmitter {
 
   // ─── Message dispatch ───────────────────────────────────────────────────
 
-  private handleMessage(raw: string, remoteIp: string, remotePort: number): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private handleMessage(raw: string, remoteIp: string, remotePort: number, tcpSend?: (data: string) => void): void {
     const msg = parseSipMessage(raw);
     if (!msg) {
       logger.warn(`Could not parse SIP message from ${remoteIp}:${remotePort}`);
@@ -114,7 +143,7 @@ export class SipServer extends EventEmitter {
 
     switch (msg.method) {
       case "INVITE":
-        this.handleInvite(msg, remoteIp, remotePort).catch((e) =>
+        this.handleInvite(msg, remoteIp, remotePort, tcpSend).catch((e) =>
           logger.error("Error handling INVITE", e)
         );
         break;
@@ -173,7 +202,9 @@ export class SipServer extends EventEmitter {
   private async handleInvite(
     msg: SipMessage,
     remoteIp: string,
-    remotePort: number
+    remotePort: number,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tcpSend?: (data: string) => void
   ): Promise<void> {
     const callId = msg.callId;
     logger.info(`Incoming INVITE call-id=${callId} from=${msg.from}`);
@@ -298,7 +329,7 @@ export class SipServer extends EventEmitter {
         contentType: "application/sdp",
       });
 
-      this.sendResponse(ok200, remoteIp, remotePort);
+      this.sendResponse(ok200, remoteIp, remotePort, tcpSend);
       logger.info(`[${callId}] Sent 200 OK with SDP answer, RTP port ${localRtpPort}`);
 
     } catch (err) {
@@ -453,12 +484,96 @@ export class SipServer extends EventEmitter {
     }
   }
 
-  private sendResponse(message: string, ip: string, port: number): void {
-    const buf = Buffer.from(message, "utf8");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private sendResponse(message: string, ip: string, port: number, tcpSend?: (data: string) => void): void {
     logger.debug(`SIP → ${ip}:${port}\n${message.slice(0, 300)}`);
-    this.socket.send(buf, port, ip, (err) => {
-      if (err) logger.warn(`Failed to send SIP response to ${ip}:${port}`, err);
-    });
+    if (tcpSend) {
+      tcpSend(message);
+    } else {
+      const buf = Buffer.from(message, "utf8");
+      this.socket.send(buf, port, ip, (err) => {
+        if (err) logger.warn(`Failed to send SIP response to ${ip}:${port}`, err);
+      });
+    }
+  }
+
+  /**
+   * Send periodic SIP OPTIONS to Chime Voice Connector to signal we are alive.
+   * Equivalent to Asterisk pjsip.conf qualify_frequency=30.
+   * Without this, Chime may not complete the SIP handshake with our endpoint.
+   */
+  /**
+   * Send SIP REGISTER to Chime Voice Connector.
+   * Chime requires registration before it will complete the ACK handshake
+   * for outbound calls. This is equivalent to what chan_pjsip does automatically.
+   */
+  startRegistration(chimeVcHost: string, intervalSeconds = 60): void {
+    let cseq = 1;
+
+    const sendRegister = () => {
+      const callId   = `reg-${this.localIp}-${Date.now()}`;
+      const branch   = "z9hG4bK" + Math.random().toString(36).slice(2);
+      const tag      = Math.random().toString(36).slice(2);
+      const expiry   = intervalSeconds + 30;
+
+      const register = [
+        `REGISTER sip:${chimeVcHost} SIP/2.0`,
+        `Via: SIP/2.0/UDP ${this.localIp}:${this.sipPort};branch=${branch};rport`,
+        `From: <sip:${this.localIp}>;tag=${tag}`,
+        `To: <sip:${this.localIp}@${chimeVcHost}>`,
+        `Call-ID: ${callId}`,
+        `CSeq: ${cseq++} REGISTER`,
+        `Contact: <sip:${this.localIp}:${this.sipPort};transport=UDP>;expires=${expiry}`,
+        `Max-Forwards: 70`,
+        `Expires: ${expiry}`,
+        `Content-Length: 0`,
+        ``,
+        ``,
+      ].join("\r\n");
+
+      const buf = Buffer.from(register, "utf8");
+      this.socket.send(buf, 5060, chimeVcHost, (err) => {
+        if (err) logger.debug(`REGISTER error: ${err.message}`);
+        else logger.info(`REGISTER sent to ${chimeVcHost}`);
+      });
+    };
+
+    sendRegister();
+    setInterval(sendRegister, intervalSeconds * 1000);
+    logger.info(`SIP registration started → ${chimeVcHost} every ${intervalSeconds}s`);
+  }
+
+  startOptionsKeepalive(chimeVcHost: string, intervalSeconds = 30): void {
+    const sendOptions = () => {
+      const callId = Math.random().toString(36).slice(2);
+      const branch = "z9hG4bK" + Math.random().toString(36).slice(2);
+      const tag    = Math.random().toString(36).slice(2);
+      const options = [
+        `OPTIONS sip:${chimeVcHost} SIP/2.0`,
+        `Via: SIP/2.0/UDP ${this.localIp}:${this.sipPort};branch=${branch};rport`,
+        `From: <sip:${this.localIp}:${this.sipPort}>;tag=${tag}`,
+        `To: <sip:${chimeVcHost}>`,
+        `Call-ID: ${callId}@${this.localIp}`,
+        `CSeq: 1 OPTIONS`,
+        `Contact: <sip:${this.localIp}:${this.sipPort}>`,
+        `Max-Forwards: 70`,
+        `Content-Length: 0`,
+        ``,
+        ``,
+      ].join("\r\n");
+
+      const buf = Buffer.from(options, "utf8");
+      // Send to Chime VC host on port 5060
+      this.socket.send(buf, 5060, chimeVcHost, (err) => {
+        if (err) logger.debug(`OPTIONS keepalive error: ${err.message}`);
+        else logger.debug(`OPTIONS keepalive sent to ${chimeVcHost}`);
+      });
+    };
+
+    // Send immediately then on interval
+    sendOptions();
+    setInterval(sendOptions, intervalSeconds * 1000);
+    logger.info(`OPTIONS keepalive started → ${chimeVcHost} every ${intervalSeconds}s`);
   }
 
   getActiveSessions(): number {
