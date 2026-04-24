@@ -1,0 +1,6 @@
+# Check if anything is blocking inbound on the RTP range at the OS level
+sudo iptables -L INPUT -n -v | grep -E "10000|20000|REJECT|DROP"
+sudo iptables -L FORWARD -n -v
+
+sudo iptables -L INPUT -n -v
+sudo iptables -L FORWARD -n -v

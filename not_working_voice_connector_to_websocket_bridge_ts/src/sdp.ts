@@ -22,6 +22,7 @@ export interface ParsedSdp {
   payloadType: number;      // chosen codec payload type (0=PCMU, 8=PCMA)
   codecName: string;        // "PCMU" or "PCMA"
   sampleRate: number;
+  rtcpMux: boolean;
 }
 
 /**
@@ -94,6 +95,9 @@ export function parseSdp(sdpText: string): ParsedSdp {
     ? originIp
     : connectionIp;
 
+  // Detect rtcp-mux — Chime requires we echo this back in our SDP answer
+  const rtcpMux = lines.some((l: string) => l.trim() === "a=rtcp-mux");
+
   return {
     sessionLines: lines,
     originIp,
@@ -102,6 +106,7 @@ export function parseSdp(sdpText: string): ParsedSdp {
     payloadType: chosenPayload,
     codecName,
     sampleRate,
+    rtcpMux,
   };
 }
 
@@ -124,9 +129,15 @@ export function buildSdpAnswer(
     "s=Chime-AgentCore Bridge",
     `c=IN IP4 ${localIp}`,
     "t=0 0",
-    `m=audio ${localRtpPort} RTP/AVP ${offer.payloadType}`,
+    // Include both PCMU (0) and telephone-event (101) to match Chime's offer
+    `m=audio ${localRtpPort} RTP/AVP ${offer.payloadType} 101`,
     `a=rtpmap:${offer.payloadType} ${offer.codecName}/${offer.sampleRate}`,
+    "a=rtpmap:101 telephone-event/8000",
+    "a=fmtp:101 0-15",
     "a=sendrecv",
+    "a=ptime:20",
+    // Echo rtcp-mux if offered — required for Chime to start sending RTP
+    ...(offer.rtcpMux ? ["a=rtcp-mux"] : [`a=rtcp:${localRtpPort + 1}`]),
     "",
   ];
   return lines.join("\r\n");

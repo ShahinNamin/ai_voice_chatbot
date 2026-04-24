@@ -66,6 +66,26 @@ export class CallSession {
     // Connect to AgentCore
     await this.agentClient.connect();
 
+    // ── RTP punch-through: send silence to Chime immediately after call setup
+    // Chime (and many SIP implementations) won't send RTP until they receive
+    // a packet from us first — this opens the NAT pinhole and triggers RTP flow
+    const silencePacket = Buffer.alloc(160).fill(0xff); // 20ms of PCMU silence (0xFF)
+    let punchThroughDone = false;
+    const punchThrough = setInterval(() => {
+      if (punchThroughDone) {
+        clearInterval(punchThrough);
+        return;
+      }
+      this.rtp.sendAudio(silencePacket);
+      logger.debug(`[${this.callId}] RTP punch-through silence sent`);
+    }, 20);
+
+    // Stop punch-through after 2 seconds or when real audio arrives
+    setTimeout(() => {
+      punchThroughDone = true;
+      clearInterval(punchThrough);
+    }, 2000);
+
     // ── Phone → Agent pipeline ────────────────────────────────────────────
     let rtpPacketsReceived = 0;
     let audioSentToAgent = 0;
@@ -74,6 +94,8 @@ export class CallSession {
       rtpPacketsReceived++;
       if (rtpPacketsReceived === 1) {
         logger.info(`[${this.callId}] ✅ First RTP packet received from phone (${payload.length} bytes)`);
+        punchThroughDone = true; // stop sending silence
+        clearInterval(punchThrough);
       }
       if (rtpPacketsReceived % 500 === 0) {
         logger.info(`[${this.callId}] 📞 RTP packets received: ${rtpPacketsReceived}, sent to agent: ${audioSentToAgent}`);

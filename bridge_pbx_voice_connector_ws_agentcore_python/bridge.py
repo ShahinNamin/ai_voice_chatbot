@@ -209,6 +209,7 @@ def parse_sip(raw: bytes) -> Optional[dict]:
     method = parts[0]
 
     headers: dict[str, str] = {}
+    via_list: list[str] = []          # ordered list of all Via headers
     for line in header_lines[1:]:
         if not line:
             continue
@@ -220,9 +221,14 @@ def parse_sip(raw: bytes) -> Optional[dict]:
             # Compact forms: v → via, f → from, t → to, i → call-id, m → contact
             compact = {"v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact"}
             key = compact.get(k.strip().lower(), k.strip().lower())
-            headers[key] = v.strip()
+            if key == "via":
+                via_list.append(v.strip())
+                headers["via"] = v.strip()   # keep last for compat; use via_list for responses
+            else:
+                headers[key] = v.strip()
 
-    return {"method": method, "first_line": first_line, "headers": headers, "body": body}
+    return {"method": method, "first_line": first_line, "headers": headers,
+            "via_list": via_list, "body": body}
 
 
 def via_response_addr(via_value: str, actual_src: tuple) -> tuple:
@@ -299,9 +305,16 @@ def build_sip_response(
     if to_tag and "tag=" not in to_hdr:
         to_hdr = f"{to_hdr};tag={to_tag}"
 
+    # Echo ALL Via headers in original order (RFC 3261 §8.2.6.1).
+    # Chime sends two Via headers (proxy outer + internal node inner).
+    # If we only echo one, the proxy cannot route the ACK back to us.
+    via_lines = "".join(
+        f"Via: {v}\r\n" for v in req.get("via_list", [h.get("via", "")])
+    )
+
     resp = (
         f"SIP/2.0 {code} {reason}\r\n"
-        f"Via: {h.get('via', '')}\r\n"
+        f"{via_lines}"
         f"From: {h.get('from', '')}\r\n"
         f"To: {to_hdr}\r\n"
         f"Call-ID: {h.get('call-id', '')}\r\n"
@@ -421,6 +434,12 @@ def unpack_audio(data: bytes):
     """
     Decode Frame { audio_raw_frame: AudioRawFrame{...} } → (pcm16, sample_rate).
     Returns None if the frame is not an AudioRawFrame (e.g. text/control frames).
+
+    Pipecat proto field map (frames.proto):
+      Frame.audio_raw_frame       = field 4   (agent TTS output → we send to RTP)
+      Frame.input_audio_raw_frame = field 5   (our mic input → we send TO agent)
+      Frame.text_frame            = field 2   (transcript/control JSON)
+      Frame.llm_full_response     = field 14  (text control)
     """
     pos = 0
     while pos < len(data):
@@ -429,8 +448,13 @@ def unpack_audio(data: bytes):
         if wt == 2:
             ln, pos = _decode_varint(data, pos)
             payload  = data[pos:pos+ln]; pos += ln
-            if fn == 4:                # audio_raw_frame
+            if fn == 4:                # audio_raw_frame — TTS audio from agent
                 return _decode_audio_inner(payload)
+            if fn == 2:                # text_frame — log as ctrl
+                try:
+                    log.debug("WS frame: text_frame(field2) = %s", payload.decode("utf-8", errors="replace")[:200])
+                except Exception:
+                    pass
             # other length-delimited fields: skip
         elif wt == 0:
             _, pos = _decode_varint(data, pos)
@@ -474,8 +498,29 @@ class PbxBridge:
     # ── IP detection ──────────────────────────────────────────────────────────
 
     def _detect_local_ip(self) -> str:
+        """
+        Return the IP address to advertise in SDP and to bind RTP sockets to.
+
+        On EC2 (and any host behind NAT) this MUST be the private/interface IP,
+        NOT the public/elastic IP.  The OS always sources UDP packets from the
+        private interface address; if the SDP advertises the public IP instead,
+        Chime's symmetric-RTP filter sees a source-IP mismatch and drops every
+        inbound RTP packet silently.
+
+        LOCAL_IP env-var is kept as an escape hatch (e.g. non-NAT bare-metal
+        deployments) but on EC2 you should leave it unset and let the socket
+        probe below discover the correct private IP automatically.
+        """
         env = os.getenv("LOCAL_IP")
         if env:
+            if _is_private_ip(env):
+                log.info("LOCAL_IP override: %s (private — correct for EC2/NAT)", env)
+            else:
+                log.warning(
+                    "LOCAL_IP=%s looks like a public IP. On EC2 behind NAT this will "
+                    "cause RTP source-IP mismatches and Chime will drop all inbound RTP. "
+                    "Unset LOCAL_IP to auto-detect the correct private interface IP.", env
+                )
             return env
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -489,11 +534,32 @@ class PbxBridge:
     # ── RTP port allocation ───────────────────────────────────────────────────
 
     def _alloc_rtp_port(self) -> tuple:
-        """Allocate an even RTP port with port+1 free for RTCP (RFC 3550)."""
+        """Allocate an even RTP port with port+1 free for RTCP (RFC 3550).
+
+        On EC2 with a directly-attached Elastic IP, the EIP↔private-IP
+        translation is performed at the AWS hypervisor *outside* the instance.
+        The instance's network stack only ever sees the private IP (172.31.x.x).
+
+        We must bind to 0.0.0.0 (not the private IP) so the socket accepts
+        inbound packets — binding to the specific private IP causes the kernel
+        to reject packets with ICMP "port unreachable" because the UDP demux
+        does not find a matching socket.
+
+        Outbound packets sourced from a 0.0.0.0-bound socket use the private
+        IP as source address, which is correct — AWS transparently rewrites
+        it to the EIP before the packet leaves the hypervisor.  Chime sees
+        RTP arriving from the public EIP, which matches the SDP c= line
+        (also set to the private IP so it matches what the OS will use).
+
+        The SDP must therefore advertise the PRIVATE IP, not the EIP.
+        _detect_local_ip() returns the private IP via the routing-socket
+        probe, which is correct for both SDP and this bind.
+        """
         for _ in range(300):
             port = random.randint(RTP_PORT_MIN, RTP_PORT_MAX - 1) & ~1   # even
             try:
-                # Bind RTP socket
+                # Bind to 0.0.0.0 so the socket receives packets regardless of
+                # which destination IP the kernel sees after EIP translation.
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.bind(("0.0.0.0", port))
                 # Verify RTCP port+1 is also free (bind then release)
@@ -503,7 +569,10 @@ class PbxBridge:
                 sock.setblocking(False)
                 return port, sock
             except OSError:
-                sock.close()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
         raise RuntimeError("No free RTP port pair in range %d-%d" % (RTP_PORT_MIN, RTP_PORT_MAX))
 
     # ── SIP dispatch ──────────────────────────────────────────────────────────
@@ -713,6 +782,29 @@ class PbxBridge:
                 session.ws = ws
                 log.info("AgentCore WS connected  call-id=%.36s", call_id)
 
+                # ── RTVI handshake ────────────────────────────────────────────
+                # FastAPIWebsocketTransport with ProtobufFrameSerializer uses
+                # the RTVI protocol. On connect the server sends a bot-ready
+                # TransportMessageFrame. The client must respond with a
+                # client-ready TransportMessageFrame before the pipeline
+                # activates and audio starts flowing.
+                #
+                # Frame { transport_message_frame(field4) {
+                #   message(field1): '{"label":"rtvi-ai","type":"client-ready","id":"1"}'
+                # }}
+                try:
+                    client_ready_json = json.dumps({
+                        "label": "rtvi-ai",
+                        "type":  "client-ready",
+                        "id":    "1",
+                    }).encode()
+                    inner = _len_field(1, client_ready_json)
+                    client_ready_frame = _len_field(4, inner)
+                    await ws.send(client_ready_frame)
+                    log.info("RTVI client-ready sent  call-id=%.36s", call_id)
+                except Exception as e:
+                    log.warning("RTVI client-ready failed: %s  call-id=%.36s", e, call_id)
+
                 await asyncio.gather(
                     self._rtp_to_ws(session, stop),
                     self._ws_to_rtp(session, stop),
@@ -824,10 +916,12 @@ class PbxBridge:
                     if rtp_packets_rx == 0:
                         log.warning("RTP→WS: NO RTP from Chime yet after 5s  call-id=%.36s"
                                     " -- check: (1) security group UDP %d-%d open inbound,"
-                                    " (2) LOCAL_IP=%s matches EC2 public IP advertised in SDP,"
+                                    " (2) SDP advertises local IP %s -- on EC2 this must be"
+                                    " the PRIVATE interface IP (e.g. 172.31.x.x), NOT the"
+                                    " public/elastic IP. Unset LOCAL_IP if it is set to a public IP."
                                     " (3) tcpdump -i any udp port %d shows inbound packets",
                                     session.call_id, RTP_PORT_MIN, RTP_PORT_MAX,
-                                    session.local_rtp_port, session.local_rtp_port)
+                                    session.remote_host, session.local_rtp_port)
                     else:
                         log.debug("RTP→WS: no RTP for 5s  packets_so_far=%d", rtp_packets_rx)
                     continue
@@ -886,15 +980,18 @@ class PbxBridge:
                 if isinstance(message, bytes):
                     ws_frames_rx += 1
                     if ws_frames_rx == 1:
-                        log.info("WS→RTP: first binary frame  %d bytes  call-id=%.36s",
-                                 len(message), session.call_id)
+                        log.info("WS→RTP: first binary frame  %d bytes  header=%s  call-id=%.36s",
+                                 len(message), message[:12].hex(), session.call_id)
+                    elif ws_frames_rx <= 5:
+                        log.debug("WS→RTP: frame #%d  %d bytes  header=%s  call-id=%.36s",
+                                  ws_frames_rx, len(message), message[:12].hex(), session.call_id)
 
                     result = unpack_audio(message)
                     if result is None:
                         # Not an AudioRawFrame — log first few occurrences then silence
-                        if ws_frames_rx <= 3:
-                            log.warning("WS→RTP: non-audio frame header=%s  call-id=%.36s",
-                                        message[:10].hex(), session.call_id)
+                        if ws_frames_rx <= 5:
+                            log.debug("WS→RTP: non-audio binary frame #%d  %d bytes  header=%s  call-id=%.36s",
+                                      ws_frames_rx, len(message), message[:16].hex(), session.call_id)
                         continue
 
                     pcm16, agent_sr = result
@@ -943,7 +1040,8 @@ class PbxBridge:
         except Exception as e:
             log.error("WS→RTP: unexpected error  call-id=%.36s : %s", session.call_id, e, exc_info=True)
         finally:
-            log.info("WS→RTP ended  call-id=%.36s  ws_frames=%d  rtp_tx=%d",
+            log.info("WS→RTP ended  call-id=%.36s  ws_frames_rx=%d  rtp_packets_tx=%d  "
+                     "(if rtp_packets_tx=0: agent sent no AudioRawFrame field-4 frames)",
                      session.call_id, ws_frames_rx, rtp_packets_tx)
             stop.set()   # signal _rtp_to_ws to exit too
 
