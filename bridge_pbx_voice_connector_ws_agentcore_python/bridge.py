@@ -886,6 +886,12 @@ class PbxBridge:
             await asyncio.sleep(interval)
             if stop.is_set():
                 break
+            # Skip keepalive if the rtp_output_task is actively sending audio.
+            # Both tasks share seq/timestamp state — concurrent sends cause
+            # sequence number gaps that Chime's jitter buffer discards as loss.
+            rtp_queue = getattr(session, '_rtp_out_queue', None)
+            if rtp_queue is not None and not rtp_queue.empty():
+                continue
             if getattr(session, 'suppress_keepalive', False):
                 session.suppress_keepalive = False
                 continue
@@ -1000,6 +1006,7 @@ class PbxBridge:
         # a monotonic clock, smoothing the stream into a steady cadence.
         import time as _time
         rtp_out_queue: asyncio.Queue = asyncio.Queue(maxsize=400)
+        session._rtp_out_queue = rtp_out_queue   # expose to keepalive for coordination
         PACKET_INTERVAL = CHIME_FRAME_MS / 1000.0  # 0.020s
 
         async def _rtp_output_task():
