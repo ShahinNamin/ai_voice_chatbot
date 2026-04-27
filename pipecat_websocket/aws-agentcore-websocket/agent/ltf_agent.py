@@ -427,8 +427,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             model="amazon.nova-pro-v1:0",
             temperature=0.8,
             system_instruction=system_instructions,
-            latency="optimized" ,
-            enable_prompt_caching =True
+            # latency="optimized" ,
+            # enable_prompt_caching =True
 
         ),
     )
