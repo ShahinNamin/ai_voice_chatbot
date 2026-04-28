@@ -19,6 +19,17 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+from pipecat.frames.frames import (
+    Frame,
+    LLMTextFrame,
+    LLMThoughtStartFrame,
+    LLMThoughtTextFrame, 
+    LLMThoughtEndFrame,
+    TextFrame,
+    LLMFullResponseStartFrame,
+)
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+
 from pipecat.runner.types import RunnerArguments
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.services.aws.llm import AWSBedrockLLMService
@@ -30,7 +41,12 @@ from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.frames.frames import EndTaskFrame
 from pipecat.processors.frame_processor import FrameDirection
 import boto3
+import uuid
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+
+import re
+from pipecat.utils.text.base_text_filter import BaseTextFilter
 
 app = BedrockAgentCoreApp()
 
@@ -331,6 +347,151 @@ system_instructions="""
   Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: Australian English (en-AU).
   </instructions>
 """
+
+
+class StripInternalTagsProcessor(FrameProcessor):
+    """
+    Strips <thinking>...</thinking> and <message>...</message> wrapper tags
+    from LLM output tokens before they reach TTS or the context aggregator.
+
+    Handles tags split across multiple tokens by tracking state with a buffer.
+    Both TTS (Polly) and conversation history will receive clean text only.
+
+    Supported tags: <thinking>, <message> — extend SKIP_TAGS / UNWRAP_TAGS as needed.
+    """
+
+    # Content inside these tags is dropped entirely (never spoken or stored)
+    SKIP_TAGS = ["thinking"]
+
+    # Content inside these tags is kept but the tags themselves are stripped
+    UNWRAP_TAGS = ["message"]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._reset()
+
+    def _reset(self):
+        self._buffer = ""          # accumulates partial tag text across tokens
+        self._skipping = False     # True when inside a SKIP tag
+        self._skip_tag = None      # which skip tag we're currently inside
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._reset()
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, LLMTextFrame):
+            cleaned = self._process_text(frame.text)
+            if cleaned:
+                await self.push_frame(LLMTextFrame(text=cleaned), direction)
+            # If cleaned is empty, swallow the frame — don't push empty tokens
+
+        else:
+            await self.push_frame(frame, direction)
+
+    def _process_text(self, incoming: str) -> str:
+        # Work on buffered remainder + new token
+        text = self._buffer + incoming
+        self._buffer = ""
+        output = []
+
+        while text:
+            if self._skipping:
+                # Look for closing tag of the current skip tag
+                close = f"</{self._skip_tag}>"
+                idx = text.find(close)
+                if idx != -1:
+                    # Found closing tag — resume after it
+                    self._skipping = False
+                    self._skip_tag = None
+                    text = text[idx + len(close):]
+                else:
+                    # Closing tag not yet received — buffer everything
+                    # (it might arrive split across the next token)
+                    self._buffer = text
+                    break
+
+            else:
+                # Scan for the earliest opening tag from either list
+                earliest_idx = len(text)
+                earliest_tag = None
+                earliest_action = None
+
+                for tag in self.SKIP_TAGS:
+                    open_tag = f"<{tag}>"
+                    idx = text.find(open_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "skip"
+
+                for tag in self.UNWRAP_TAGS:
+                    # Strip opening tag
+                    open_tag = f"<{tag}>"
+                    idx = text.find(open_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "unwrap_open"
+
+                    # Strip closing tag
+                    close_tag = f"</{tag}>"
+                    idx = text.find(close_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "unwrap_close"
+
+                if earliest_tag is None:
+                    # Check for a possible partial tag at the end of the token
+                    # e.g. token ends with "<thin" — buffer it so next token completes it
+                    partial = self._find_partial_tag_at_end(text)
+                    if partial:
+                        output.append(text[:-len(partial)])
+                        self._buffer = partial
+                    else:
+                        output.append(text)
+                    break
+
+                # Emit clean text before the tag
+                output.append(text[:earliest_idx])
+
+                if earliest_action == "skip":
+                    open_tag = f"<{earliest_tag}>"
+                    self._skipping = True
+                    self._skip_tag = earliest_tag
+                    text = text[earliest_idx + len(open_tag):]
+
+                elif earliest_action == "unwrap_open":
+                    open_tag = f"<{earliest_tag}>"
+                    text = text[earliest_idx + len(open_tag):]
+
+                elif earliest_action == "unwrap_close":
+                    close_tag = f"</{earliest_tag}>"
+                    text = text[earliest_idx + len(close_tag):]
+
+        return "".join(output)
+
+    def _find_partial_tag_at_end(self, text: str) -> str:
+        """
+        Detect if the text ends with a partial opening or closing tag,
+        e.g. '<thin', '</mes', '<' — to buffer across token boundaries.
+        """
+        all_tags = self.SKIP_TAGS + self.UNWRAP_TAGS
+        # Check increasingly long suffixes for a '<' that starts a known tag
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] == "<":
+                partial = text[i:]
+                # Check if it could be the start of any known tag
+                for tag in all_tags:
+                    if f"<{tag}>".startswith(partial) or f"</{tag}>".startswith(partial):
+                        return partial
+                break
+        return ""
+
+
 async def direct_to_human_agent(params: FunctionCallParams):
     await params.result_callback({'action':'DirectToHumanAgent'})
     await params.llm.push_frame(TTSSpeakFrame("Thanks for Calling, I'll now transfer you to our specialist human agents. Goodbye!"))
@@ -343,12 +504,18 @@ async def end_customer_call(params: FunctionCallParams):
 async def verify_user(params: FunctionCallParams):
     table_name = "connect_chime_call_metadata"
 
+    
+
     full_name = params.arguments.get("fullName")
     address = params.arguments.get("address")
     phone_number = params.arguments.get("phoneNumber")
     contact_id = params.arguments.get("contactId")
     property_address = params.arguments.get("propertyAddress")
     email = params.arguments.get("email")
+
+    if contact_id is None or contact_id =='':
+        contact_id = str(uuid.uuid4())
+
     
     #write information to dynamodb. Note that this is dummy data so we are trying to see if the agent picked up the information correctly or not
     #The proper implementation needs to do fuzzy matching of the available information, and mention what information doesn't match.
@@ -419,7 +586,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             )
         )
 
-
     # Automatically uses credentials from assumed IAM role when running in AgentCore
     # Runtime, or from environment variables when running locally.
     llm = AWSBedrockLLMService(
@@ -482,10 +648,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                     "type":"string",
                     "description": "phone number of the user to be verified"
                 }, 
-                "contactId": {
-                    "type":"string",
-                    "description": "contact id of the user to be verified. Note this shouldn't be asked as often as they wouldn't know. In that case, just pass an empty string"
-                },
+                # "contactId": {
+                #     "type":"string",
+                #     "description": "contact id of the user to be verified. Note this shouldn't be asked as often as they wouldn't know. In that case, just pass an empty string"
+                # },
                 "propertyAddress": {
                     "type":"string",
                     "description": "property address of the loan, which the loan is associated with for the user. This can be used to verify the user"
@@ -504,19 +670,19 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         name = "generate_and_send_statement",
         description="This will generate the bank statement / transaction records and will email it to the user. Make sure you confirm with the user if it is ok to generate and send their statement.",
         properties={
-            "startDate": 
-            {
-                "type":"string", 
-                "description":"start date to generate the user's statement from. Note that this can be passed as an empty string, or a date, or a relative date, such as 3 months ago, a year ago, etc."
-            } , 
-            "endDate": 
-            {
-                "type": "string",
-                "description":"end date to generate the user's statement till. Note that this can be passed as Now, or a date of any sort."
-            }
+            # "startDate": 
+            # {
+            #     "type":"string", 
+            #     "description":"start date to generate the user's statement from. Note that this can be passed as an empty string, or a date, or a relative date, such as 3 months ago, a year ago, etc."
+            # } , 
+            # "endDate": 
+            # {
+            #     "type": "string",
+            #     "description":"end date to generate the user's statement till. Note that this can be passed as Now, or a date of any sort."
+            # }
 
         } , 
-        required=["startDate","endDate"]
+        required=[]
 
     )
 
@@ -564,6 +730,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             user_aggregator,
             llm,
+            StripInternalTagsProcessor(),  
             tts,
             transport.output(),
             assistant_aggregator,
