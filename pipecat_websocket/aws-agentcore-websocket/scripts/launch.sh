@@ -12,7 +12,7 @@ AGENTCORE_CONFIG=".bedrock_agentcore.yaml"
 # Check if the agentcore config exists
 if [ ! -f "$AGENTCORE_CONFIG" ]; then
     echo "Error: $AGENTCORE_CONFIG not found"
-    echo "Please run 'uv run agentcore configure -e agent/agent.py' first to configure your agent"
+    echo "Please run 'uv run agentcore configure -e agent/ltf_agent_elevenlabs.py' first to configure your agent"
     exit 1
 fi
 

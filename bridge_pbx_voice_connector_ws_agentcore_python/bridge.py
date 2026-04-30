@@ -72,7 +72,7 @@ RTP_PORT_MIN      = int(os.getenv("RTP_PORT_MIN", "10000"))
 RTP_PORT_MAX      = int(os.getenv("RTP_PORT_MAX", "20000"))
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN", "")
 AWS_REGION        = os.getenv("AWS_REGION", "us-east-1")
-SIGNED_URL_EXPIRY = int(os.getenv("SIGNED_URL_EXPIRY_SECONDS", "300"))
+SIGNED_URL_EXPIRY = int(os.getenv("SIGNED_URL_EXPIRY_SECONDS", "3600"))
 HTTP_HEALTH_PORT  = int(os.getenv("HTTP_HEALTH_PORT", "8080"))
 # FQDN of your Chime Voice Connector — used for outbound OPTIONS pings.
 # Find it in AWS Console → Chime SDK → Voice Connectors → your VC → General.

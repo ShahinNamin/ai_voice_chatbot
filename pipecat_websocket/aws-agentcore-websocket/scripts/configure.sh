@@ -31,7 +31,7 @@ fi
 ###############################################
 echo "Configuring AgentCore with execution role: $ROLE_ARN"
 uv run agentcore configure \
-    -e ./agent/agent.py \
+    -e ./agent/ltf_agent_elevenlabs.py \
     --name pipecat_agent \
     --container-runtime docker \
     --disable-memory \
