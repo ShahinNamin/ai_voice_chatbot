@@ -165,9 +165,17 @@ CHIME_VC_FQDN     = os.getenv("CHIME_VC_FQDN", "")
 OPTIONS_INTERVAL  = int(os.getenv("OPTIONS_INTERVAL", "30"))
 
 # Session timer (RFC 4028)
-SESSION_EXPIRES_S     = int(os.getenv("SESSION_EXPIRES_S", "1800"))
+#
+# SESSION_EXPIRES_S controls how often we send a SIP re-INVITE to Chime.
+# Chime Voice Connector has a ~150s media inactivity timer: if the PSTN caller
+# goes quiet (listening to the agent) for >150s, Chime kills its inbound RTP
+# stream. A periodic re-INVITE resets this timer.
+#
+# Default: 120s  ->  refresh fires at ~50s (SE/2 - 10), safely before 150s.
+# Do NOT raise this above 120 without also adjusting RTP_SILENCE_HANGUP_S.
+SESSION_EXPIRES_S     = int(os.getenv("SESSION_EXPIRES_S", "120"))
 MIN_SE_S              = int(os.getenv("MIN_SE_S", "90"))
-SIP_SESSION_REFRESH_S = int(os.getenv("SIP_SESSION_REFRESH_S", "890"))
+SIP_SESSION_REFRESH_S = int(os.getenv("SIP_SESSION_REFRESH_S", "50"))
 
 # Watchdog timeouts
 RTP_SILENCE_TIMEOUT_S = int(os.getenv("RTP_SILENCE_TIMEOUT_S", "10"))
@@ -1602,11 +1610,22 @@ class PbxBridge:
         session.agent_to_rtp_queue = asyncio.Queue(maxsize=400)
 
         # Use call-id as the AgentCore session id (stable per call).
-        # BUG FIX: SIP Call-IDs can contain '@' and other chars that AgentCore
+        # BUG FIX 1: SIP Call-IDs can contain '@' and other chars that AgentCore
         # rejects in runtimeSessionId (which allows only [a-zA-Z0-9_-]).
         # Strip anything outside that set and truncate to 128 chars.
+        # BUG FIX 2: AgentCore requires runtimeSessionId to be at least 33 chars.
+        # Some SIP stacks (e.g. FreeSWITCH, certain ATAs) generate purely numeric
+        # call-IDs as short as 20-24 digits. After sanitization these remain too
+        # short and AgentCore rejects the invocation with:
+        #   "Invalid length for parameter runtimeSessionId, value: N, valid min length: 33"
+        # Fix: if the sanitized ID is shorter than 33 chars, append a dash and a
+        # zero-padded suffix derived from a random int so it reaches exactly 33.
         import re as _re
         safe_session_id = _re.sub(r"[^a-zA-Z0-9_\-]", "-", call_id)[:128]
+        _AGENTCORE_MIN_SESSION_ID_LEN = 33
+        if len(safe_session_id) < _AGENTCORE_MIN_SESSION_ID_LEN:
+            pad_len = _AGENTCORE_MIN_SESSION_ID_LEN - len(safe_session_id) - 1  # -1 for dash
+            safe_session_id = safe_session_id + "-" + ("%0*d" % (pad_len, random.randint(0, 10**pad_len - 1)))
         session.agentcore_session_id = safe_session_id
 
         chime_codecs = "0 101"
@@ -1646,9 +1665,20 @@ class PbxBridge:
             chime_minse = int(minse_hdr.strip()) if minse_hdr else MIN_SE_S
         except ValueError:
             chime_minse = MIN_SE_S
-        negotiated_se = max(SESSION_EXPIRES_S, chime_se, chime_minse, 90)
+        # Negotiation: honour Chime's Min-SE floor but cap at SESSION_EXPIRES_S.
+        # SESSION_EXPIRES_S is intentionally low (120s) to send re-INVITEs before
+        # Chime's ~150s media inactivity timer kills the inbound RTP stream.
+        # We take max(min-SE floors, our cap) rather than max(everything), so a
+        # Chime header like "Session-Expires: 1800" cannot push us past our cap.
+        se_floor      = max(chime_minse, MIN_SE_S, 90)  # must respect min-SE
+        negotiated_se = max(se_floor, SESSION_EXPIRES_S)  # our cap is the ceiling
         session.session_expires     = negotiated_se
-        session.sip_refresh_interval = max(MIN_SE_S, negotiated_se // 2 - 10)
+        # Refresh at SE/2 - 10s, but never below MIN_SE_S and never above 50s
+        # (50s keeps us safely under Chime's 150s inactivity kill regardless of SE).
+        session.sip_refresh_interval = min(
+            max(MIN_SE_S, negotiated_se // 2 - 10),
+            SIP_SESSION_REFRESH_S,
+        )
 
         self.sessions[call_id] = session
 
@@ -2071,11 +2101,40 @@ class PbxBridge:
         log.info("RTCP keepalive started  dest=%s:%d  call-id=%.36s",
                  dest[0], rtcp_port, session.call_id)
         ntp_offset = 2208988800
+
+        # EC2 connection tracking keepalive interval.
+        #
+        # EC2 conntrack has two UDP timeouts:
+        #   - UDP (single-direction or single req/resp): 30s default, max 60s
+        #   - UDP stream (bidirectional, >1 req/resp):  180s default, max 180s
+        #
+        # Our call drops at ~180s because the Chime→bridge RTP inbound conntrack
+        # entry expires when the caller is listening (not talking). The bridge→Chime
+        # outbound direction stays alive via the continuous silence frames from
+        # _rtp_output_loop, but EC2 conntrack tracks each direction independently.
+        #
+        # Fix: send a keepalive on the RTP socket (not just RTCP) toward Chime's
+        # RTP source port every CONNTRACK_KEEPALIVE_S seconds. This refreshes the
+        # conntrack entry for the Chime→bridge inbound flow by proving the bridge
+        # is actively communicating on that 5-tuple.
+        #
+        # We send a minimal RTP comfort noise packet (payload type 13, 1 byte CN
+        # payload per RFC 3389) rather than a raw empty datagram. This is valid
+        # RTP that Chime will silently discard, and it does not affect the audio
+        # stream because CN packets are not decoded as voice by G.711 codecs.
+        # Interval is 20s — well under the 30s minimum UDP timeout.
+        CONNTRACK_KEEPALIVE_S = 20
+        _conntrack_ticks = 0
+
+        rtp_dest = (session.remote_host, session.remote_rtp_port)
+
         try:
             while not stop.is_set() and session.state == CallState.ESTABLISHED:
                 await asyncio.sleep(5.0)
                 if stop.is_set():
                     break
+
+                # --- RTCP sender report (every 5s, unchanged) ---
                 try:
                     now = _time.time()
                     ntp_sec  = int(now) + ntp_offset
@@ -2089,6 +2148,26 @@ class PbxBridge:
                     rtcp_sock.sendto(sr, dest)
                 except OSError as e:
                     log.debug("RTCP keepalive sendto: %s", e)
+
+                # --- EC2 conntrack refresh on the RTP socket (every 20s) ---
+                # Sends a minimal RTP Comfort Noise (PT=13) packet on the same
+                # source port as the RTP stream so EC2 conntrack sees bidirectional
+                # traffic on the Chime↔bridge RTP 5-tuple and resets its idle timer.
+                # This prevents the inbound conntrack entry from expiring at 180s
+                # when the caller is silent (listening to the agent).
+                _conntrack_ticks += 1
+                if _conntrack_ticks * 5 >= CONNTRACK_KEEPALIVE_S:
+                    _conntrack_ticks = 0
+                    try:
+                        # RFC 3389 Comfort Noise: PT=13, 1-byte payload (noise level 0)
+                        cn_hdr = make_rtp_header(13, session.seq, session.timestamp,
+                                                 session.ssrc, marker=False)
+                        session.rtp_socket.sendto(cn_hdr + b'\x00', rtp_dest)
+                        log.debug("Conntrack RTP keepalive sent  dest=%s:%d  call-id=%.36s",
+                                  rtp_dest[0], rtp_dest[1], session.call_id)
+                    except OSError as e:
+                        log.debug("Conntrack RTP keepalive sendto: %s  call-id=%.36s",
+                                  e, session.call_id)
         finally:
             try:
                 rtcp_sock.close()
