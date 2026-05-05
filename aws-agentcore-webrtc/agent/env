@@ -1,0 +1,19 @@
+ELEVENLABS_API_KEY=sk_ae4b15536cb8f3e853334d3092bb53ba572cc76972a9f6b3
+ELEVENLABS_VOICE_ID=ys3XeJJA4ArWMhRpcX1D
+ELEVENLABS_MODEL_ID="eleven_v3"
+
+# TURN server configuration (UDP recommended for VPC mode)
+# See README's "Environment Variables Configuration" section for more details
+# Multiple URLs provide better reliability through fallback options
+ICE_SERVER_URLS=turn:turn.cloudflare.com:3478,turn:turn.cloudflare.com:80,turns:turn.cloudflare.com:5349,turns:turn.cloudflare.com:443,stun:stun.l.google.com:19302
+ICE_SERVER_URLS=turn:turn.cloudflare.com:3478,turn:turn.cloudflare.com:80,turns:turn.cloudflare.com:5349,turns:turn.cloudflare.com:443,stun:stun.l.google.com:19302
+
+ICE_SERVER_USERNAME=LaTrobe
+ICE_SERVER_CREDENTIAL=ltf@123
+
+# AWS credentials.
+# Only needed for local development (PIPECAT_LOCAL_DEV=1).
+# When running on AgentCore, credentials come from assumed IAM role.
+# AWS_ACCESS_KEY_ID=
+# AWS_SECRET_ACCESS_KEY=
+# AWS_REGION=

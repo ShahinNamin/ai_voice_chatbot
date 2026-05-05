@@ -1,0 +1,5 @@
+uv run agentcore configure -e agent/pipecat-agent.py --container-runtime docker --disable-memory --vpc --subnets subnet-00b89e0c299a6b9a1 --security-groups sg-0122a4bc40b3bf30a --region ap-southeast-2 --execution-role AmazonBedrockAgentCoreSDKRuntime-ap-southeast-2-webrtc-kvs
+
+
+uv run agentcore launch --auto-update-on-conflict --env KVS_CHANNEL_NAME=voice-agent-turn --env AWS_REGION=ap-southeast-2 --env ELEVENLABS
+_API_KEY=sk_ae4b15536cb8f3e853334d3092bb53ba572cc76972a9f6b3 --env ELEVENLABS_VOICE_ID=ys3XeJJA4ArWMhRpcX1D --env ELEVENLABS_MODEL_ID=eleven_v3 
