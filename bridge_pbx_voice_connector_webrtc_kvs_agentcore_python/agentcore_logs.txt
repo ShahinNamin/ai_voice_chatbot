@@ -1,1 +1,1 @@
-  aws logs tail /aws/bedrock-agentcore/runtimes/pipecat_agent-CD8Zu0CUMQ-DEFAULT --log-stream-name-prefix "2026/05/04/[runtime-logs]" --follow 
+  aws logs tail /aws/bedrock-agentcore/runtimes/pipecat_agent-CD8Zu0CUMQ-DEFAULT  --follow 

@@ -37,21 +37,38 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
-
+from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.frames.frames import (
+    Frame,
+    LLMTextFrame,
+    LLMFullResponseStartFrame,
+)
+import uuid 
 system_instructions="""
   You are a friendly but professional AI customer service agent for a lending company called Latrobe Financial. Latrobe financial provides loans to customers and your role is to verify the user, and ask how you can help them. You try to collect the information they provide and their concerns, and then will try to  help users with their questions and issues. However, your actual capabilities depend entirely on the tools available to you. Do not assume you can help with any specific request without first checking what tools you have access to. 
 
   IMPORTANT: Being labeled as a "customer service agent" does NOT mean you have general customer service capabilities. You can only help with tasks that your available tools support. Do not claim abilities you cannot verify through your tools.
+  
+   Note: You can add some emotions to your text in the text. For this, you can just add any of these emotional tags: [laughs], [laughs harder], [starts laughing], [wheezing] , [whispers] , [sighs], [exhales] , [sarcastic], [curious], [excited], [crying], [snorts], [mischievously]. If you use the tag, that emotion will be used for the whole sentence from that point on. So make sure the sentence ends (with a period: . ) The next sentence after . (period), will not carry that emotion. Similarly, you can also use Ellipses (…) to add pauses and weight. 
+  
+    NOte: Try to use these emotions and styles of talking sporadically, don't fill your sentences with them. If none of these appear, the tone will be normal. 
+
+    Now back to your objective. 
 
   Your goal is to resolve the user's issues while being responsive and helpful. Specifically, if the user asks about their latest transactions, and if the payments have been successful, you should mention that unfortunately it cannot be seen in the statements they can download from the website, and hence you should ask the user if they are happy for you to export the latest statement and send it to them via email.
   
   The conversation should flow like this: 
-  - You initiate the conversation with the user, and ask if they can confirm if they are a borrower or a broker. 
-  - If it is a borrower, proceed to the next steps, otherwise, let ask the user to stay on the line while you transfer them to the customer service. 
+  - You initiate the conversation with the user by introducing yourself and mentioning that you can assist them with their accounts and balance information. 
+  - Ask them what you can assist them. Once you captured that, try to infer from what they said, if they are a borrower or a broker who calls on behalf of a customer or a potential customer. If you can't infer that from them, explicitly ask if they can let you know if they are a borrower or a broker. Also, if what they ask is not within your responsibilities, let them know and ask if they want you to transfer them to a human agent before moving to the next step, which is to verify them. 
+  - If the caller is a borrower, proceed to the next steps, otherwise, (if they are a broker), ask the user to stay on the line while you transfer them to the customer service. 
+  - If they are a borrower, mention you need to verify them before proceeding further.
+  - If you have an answer to their question / ask / enquiries, don't provide extra information straight away; provide that after you verify them.
+  -For verification, ask for their phone number, name, address, property address, email address. Ask for 3 out of these options. You can let them know that you need three pieces of information for verification, but then, make sure you ask the information you need, one by one. For instance, ask if they can provide their full name, once you captured that, ask for their email address or phone number, etc., and once you captured that single piece of information, ask for the last piece of information (from the list of other pieces of information you can use which you haven't gathered yet. 
+  - Once they provide 3 pieces of information, then verify the user by calling the right tool with the information you gathered.
+  - Note: As a last resort, after asking for 3 pieces of information from the user, if you still can't verify them, you should already have access to the contactId (the caller won't know their contactId, you should be able to find it in System variables.). Try not to use this for verification as much as possible, and if you happen to want to use it, there is no need to let the user know about it. 
+  - Once verified, confirm what you think / understood / gathered they need help with / their enquiries. Also, if there are extra information you'd like to let them know (for instance, on how you can help them with their specific needs. ) before you take action, this is the right time to tell them. Then make sure you respond to their requests properly. 
   
-  - Then ask if they are ok if you verify their identity? 
-  - Ask for their phone number, name, address, property address, post code, email address. Ask for 3 out of these options one by one, and then verify the user by calling the right tool once you have the information.
-  - 
+  
 
   <formatting_requirements>
   MUST format all responses with this structure:
@@ -66,6 +83,13 @@ system_instructions="""
 
   MUST NEVER put thinking content inside message tags.
   MUST always start with `<message>` tags, even when using tools, to let the customer know you are working to resolve their issue.
+  
+  Note: You can add some emotions to your text in the message tag. For this, you can just add any of these emotional tags: [laughs], [laughs harder], [starts laughing], [wheezing] , [whispers] , [sighs], [exhales] , [sarcastic], [curious], [excited], [crying], [snorts], [mischievously]. If you use the tag, that emotion will be used for the whole sentence from that point on. So make sure the sentence ends (with a period: . ) The next sentence after . (period), will not carry that emotion. 
+  
+  Note: You can also use Ellipses (…) to add pauses and weight. Note again this is only allowed in the message tag. 
+  
+  Try to use these emotions and styles of talking sporadically, don't fill your sentences with them. If none of these appear, the tone will be normal. 
+  
   </formatting_requirements>
 
   <response_examples>
@@ -313,7 +337,7 @@ system_instructions="""
   • Technical support (24/7)
   </message>
 
-  MUST respond in the language specified by your configured locale, Australian English (en-AU), regardless of what language the customer uses.
+  MUST respond in the language specified by your configured locale ({{$.locale}}) regardless of what language the customer uses.
 
   Example - Responding in configured locale:
   When locale is fr-FR:
@@ -328,11 +352,154 @@ system_instructions="""
   I can help you with your account. Let me look up your information.
   </message>
 
+  
 
   <instructions>
-  Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: Australian English (en-AU).
+  Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: en-au (Australian).
   </instructions>
+
 """
+class StripInternalTagsProcessor(FrameProcessor):
+    """
+    Strips <thinking>...</thinking> and <message>...</message> wrapper tags
+    from LLM output tokens before they reach TTS or the context aggregator.
+
+    Handles tags split across multiple tokens by tracking state with a buffer.
+    Both TTS (Polly) and conversation history will receive clean text only.
+
+    Supported tags: <thinking>, <message> — extend SKIP_TAGS / UNWRAP_TAGS as needed.
+    """
+
+    # Content inside these tags is dropped entirely (never spoken or stored)
+    SKIP_TAGS = ["thinking"]
+
+    # Content inside these tags is kept but the tags themselves are stripped
+    UNWRAP_TAGS = ["message"]
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._reset()
+
+    def _reset(self):
+        self._buffer = ""          # accumulates partial tag text across tokens
+        self._skipping = False     # True when inside a SKIP tag
+        self._skip_tag = None      # which skip tag we're currently inside
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._reset()
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, LLMTextFrame):
+            cleaned = self._process_text(frame.text)
+            if cleaned:
+                await self.push_frame(LLMTextFrame(text=cleaned), direction)
+            # If cleaned is empty, swallow the frame — don't push empty tokens
+
+        else:
+            await self.push_frame(frame, direction)
+
+    def _process_text(self, incoming: str) -> str:
+        # Work on buffered remainder + new token
+        text = self._buffer + incoming
+        self._buffer = ""
+        output = []
+
+        while text:
+            if self._skipping:
+                # Look for closing tag of the current skip tag
+                close = f"</{self._skip_tag}>"
+                idx = text.find(close)
+                if idx != -1:
+                    # Found closing tag — resume after it
+                    self._skipping = False
+                    self._skip_tag = None
+                    text = text[idx + len(close):]
+                else:
+                    # Closing tag not yet received — buffer everything
+                    # (it might arrive split across the next token)
+                    self._buffer = text
+                    break
+
+            else:
+                # Scan for the earliest opening tag from either list
+                earliest_idx = len(text)
+                earliest_tag = None
+                earliest_action = None
+
+                for tag in self.SKIP_TAGS:
+                    open_tag = f"<{tag}>"
+                    idx = text.find(open_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "skip"
+
+                for tag in self.UNWRAP_TAGS:
+                    # Strip opening tag
+                    open_tag = f"<{tag}>"
+                    idx = text.find(open_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "unwrap_open"
+
+                    # Strip closing tag
+                    close_tag = f"</{tag}>"
+                    idx = text.find(close_tag)
+                    if idx != -1 and idx < earliest_idx:
+                        earliest_idx = idx
+                        earliest_tag = tag
+                        earliest_action = "unwrap_close"
+
+                if earliest_tag is None:
+                    # Check for a possible partial tag at the end of the token
+                    # e.g. token ends with "<thin" — buffer it so next token completes it
+                    partial = self._find_partial_tag_at_end(text)
+                    if partial:
+                        output.append(text[:-len(partial)])
+                        self._buffer = partial
+                    else:
+                        output.append(text)
+                    break
+
+                # Emit clean text before the tag
+                output.append(text[:earliest_idx])
+
+                if earliest_action == "skip":
+                    open_tag = f"<{earliest_tag}>"
+                    self._skipping = True
+                    self._skip_tag = earliest_tag
+                    text = text[earliest_idx + len(open_tag):]
+
+                elif earliest_action == "unwrap_open":
+                    open_tag = f"<{earliest_tag}>"
+                    text = text[earliest_idx + len(open_tag):]
+
+                elif earliest_action == "unwrap_close":
+                    close_tag = f"</{earliest_tag}>"
+                    text = text[earliest_idx + len(close_tag):]
+
+        return "".join(output)
+
+    def _find_partial_tag_at_end(self, text: str) -> str:
+        """
+        Detect if the text ends with a partial opening or closing tag,
+        e.g. '<thin', '</mes', '<' — to buffer across token boundaries.
+        """
+        all_tags = self.SKIP_TAGS + self.UNWRAP_TAGS
+        # Check increasingly long suffixes for a '<' that starts a known tag
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] == "<":
+                partial = text[i:]
+                # Check if it could be the start of any known tag
+                for tag in all_tags:
+                    if f"<{tag}>".startswith(partial) or f"</{tag}>".startswith(partial):
+                        return partial
+                break
+        return ""
 
 
 async def direct_to_human_agent(params: FunctionCallParams):
@@ -489,8 +656,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # AgentCore Runtime, or from environment variables when running locally.
     llm = AWSBedrockLLMService(
         settings=AWSBedrockLLMService.Settings(
-            # model="us.amazon.nova-2-lite-v1:0",
+            # model="anthropic.claude-3-haiku-20240307-v1:0",
             model="amazon.nova-pro-v1:0",
+            # model="anthropic.claude-3-sonnet-20240229-v1:0",
             temperature=0.8,
             # system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
             system_instruction=system_instructions
@@ -593,6 +761,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             user_aggregator,
             llm,
+            StripInternalTagsProcessor(),
             tts,
             transport.output(),
             assistant_aggregator,

@@ -862,7 +862,6 @@ class ChimeAudioReceiverSink:
                 if not session.rtvi_handshake_ok:
                     session.rtvi_handshake_ok = True
                     session.webrtc_connect_ts = _time.monotonic()
-                    log.info("First audio from agent (WebRTC)  call-id=%.36s", session.call_id)
 
                 # Convert av.AudioFrame -> raw mono s16le PCM bytes.
                 #
@@ -889,31 +888,6 @@ class ChimeAudioReceiverSink:
                 frame_sr = frame.sample_rate or AGENT_SAMPLE_RATE
                 sr = FORCE_AGENT_RX_RATE if FORCE_AGENT_RX_RATE > 0 else frame_sr
                 fmt = frame.format.name
-                # Diagnostic: log first 3 frames in detail
-                if session.webrtc_frames_rx <= 3:
-                    plane0_bytes = bytes(frame.planes[0])
-                    import struct as _diag_struct
-                    try:
-                        n_ch_diag = len(frame.layout.channels)
-                    except Exception:
-                        n_ch_diag = "?"
-                    expected_bytes = (frame.samples * (n_ch_diag if isinstance(n_ch_diag, int) else 1) * 2
-                                      if fmt in ("s16", "s16p") else
-                                      frame.samples * (n_ch_diag if isinstance(n_ch_diag, int) else 1) * 4)
-                    if fmt in ("fltp", "flt") and len(plane0_bytes) >= 16:
-                        first4 = _diag_struct.unpack_from("<4f", plane0_bytes)
-                        log.info("WebRTC frame #%d  fmt=%s  layout=%s  sr=%d  samples=%d  "
-                                 "planes=%d  n_channels=%s  plane0_bytes=%d (expected~%d)  first4_floats=%s  call-id=%.36s",
-                                 session.webrtc_frames_rx, fmt, frame.layout.name,
-                                 sr, frame.samples, len(frame.planes), n_ch_diag,
-                                 len(plane0_bytes), expected_bytes, [f"{v:.4f}" for v in first4],
-                                 session.call_id)
-                    else:
-                        log.info("WebRTC frame #%d  fmt=%s  layout=%s  sr=%d  samples=%d  "
-                                 "planes=%d  n_channels=%s  plane0_bytes=%d (expected~%d)  call-id=%.36s",
-                                 session.webrtc_frames_rx, fmt, frame.layout.name,
-                                 sr, frame.samples, len(frame.planes), n_ch_diag,
-                                 len(plane0_bytes), expected_bytes, session.call_id)
                 if fmt in ('fltp', 'flt', 's16p', 's16', 's32p', 's32',
                            'u8p', 'u8', 'dblp', 'dbl'):
                     import struct as _struct
@@ -1044,12 +1018,8 @@ class ChimeAudioReceiverSink:
 
                 if sr != last_logged_sr:
                     if FORCE_AGENT_RX_RATE > 0 and frame_sr != FORCE_AGENT_RX_RATE:
-                        log.info("WebRTC->RTP: agent audio frame.sample_rate=%dHz  "
-                                 "OVERRIDDEN to FORCE_AGENT_RX_RATE=%dHz  call-id=%.36s",
-                                 frame_sr, sr, session.call_id)
-                    else:
-                        log.info("WebRTC->RTP: agent audio sample_rate=%dHz  call-id=%.36s",
-                                 sr, session.call_id)
+                        log.debug("WebRTC->RTP: frame.sample_rate=%dHz overridden to %dHz  call-id=%.36s",
+                                  frame_sr, sr, session.call_id)
                     last_logged_sr = sr
                     resample_state = None  # reset resampler on rate change
                     g711_buf = b""        # flush accumulator on rate change
@@ -1135,18 +1105,45 @@ async def _establish_webrtc(session: CallSession) -> bool:
     # offer and opens its own. Without this, the agent logs:
     #   "Data channel not established within 10s after connection"
     # on every call, and RTVI bot-ready / transcript events are silently dropped.
-    # The bridge itself never sends or receives RTVI messages on this channel.
+    #
+    # CRITICAL: The bridge must send the RTVI "client-ready" message over this
+    # channel as soon as it opens. Pipecat's on_client_ready handler (which
+    # queues the opening LLMRunFrame and starts the conversation) only fires
+    # when it receives this message. Without it, the agent sits silent until
+    # the caller speaks and VAD eventually triggers — a ~55 second delay.
+    #
+    # RTVI message format (https://docs.pipecat.ai/client/rtvi-standard):
+    #   { "label": "rtvi-ai", "type": "client-ready",
+    #     "id": "<uuid>", "data": { "version": "1.0" } }
     dc = pc.createDataChannel("chat")
 
     @dc.on("open")
     def _on_dc_open():
-        log.debug("WebRTC: data channel open  call-id=%.36s", call_id)
+        import uuid as _uuid
+        import json as _json
+        client_ready = _json.dumps({
+            "label": "rtvi-ai",
+            "type":  "client-ready",
+            "id":    str(_uuid.uuid4()),
+            "data":  {
+                "version": "1.0",
+                "about": {
+                    "library":         "pbx-bridge",
+                    "library_version": "3.0",
+                    "platform":        "sip-rtp",
+                },
+            },
+        })
+        try:
+            dc.send(client_ready)
+            log.info("WebRTC: sent RTVI client-ready  call-id=%.36s", call_id)
+        except Exception as _e:
+            log.warning("WebRTC: failed to send client-ready: %s  call-id=%.36s",
+                        _e, call_id)
 
     @dc.on("message")
     def _on_dc_message(msg):
-        # RTVI messages from the agent (bot-ready, transcripts, etc.).
-        # The bridge has no consumer for these - log at DEBUG and discard.
-        log.debug("WebRTC: data channel msg (ignored): %.80s  call-id=%.36s",
+        log.debug("WebRTC: data channel msg: %.120s  call-id=%.36s",
                   msg if isinstance(msg, str) else repr(msg), call_id)
 
     ice_candidates_to_send: asyncio.Queue = asyncio.Queue()
@@ -1159,7 +1156,11 @@ async def _establish_webrtc(session: CallSession) -> bool:
 
     @pc.on("iceconnectionstatechange")
     async def on_ice_state_change():
-        log.info("WebRTC: ICE state=%s  call-id=%.36s", pc.iceConnectionState, call_id)
+        state = pc.iceConnectionState
+        if state in ("connected", "completed", "failed", "closed"):
+            log.info("WebRTC: ICE state=%s  call-id=%.36s", state, call_id)
+        else:
+            log.debug("WebRTC: ICE state=%s  call-id=%.36s", state, call_id)
 
     received_track = None
     track_event = asyncio.Event()
@@ -1913,13 +1914,6 @@ class PbxBridge:
                     sock.sendto(pkt, dest)
                     session.rtp_tx_count   += 1
                     session.rtp_tx_last_ts  = _time.monotonic()
-                    # Diagnostic: log first 5 real audio packets to confirm
-                    # non-silence content is being sent
-                    if session.rtp_tx_count <= 5:
-                        nonzero = sum(1 for b in chunk if b not in (0x7F, 0xFF, 0x00, 0xD5))
-                        log.info("RTP audio pkt #%d  len=%d  nonzero_bytes=%d  dest=%s:%d  call-id=%.36s",
-                                 session.rtp_tx_count, len(chunk), nonzero,
-                                 dest[0], dest[1], session.call_id)
                 except OSError as e:
                     log.warning("RTP output thread: sendto failed: %s", e)
                     break
