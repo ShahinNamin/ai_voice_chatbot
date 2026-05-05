@@ -207,6 +207,32 @@ RTP_PAYLOAD_PCMU    = 0
 RTP_PAYLOAD_PCMA    = 8
 RTP_VERSION         = 2
 
+# ---------------------------------------------------------------------------
+# Ringback tone (G.711 μ-law, 8 kHz, 440 Hz sine, 2s on / 4s off cycle)
+#
+# Played to the caller by the RTP keepalive task while the bridge is waiting
+# for AgentCore to cold-start (which can take 15-30s on a fresh container).
+# Without this the caller hears dead silence and often hangs up.
+#
+# Cycle: 100 × 20ms frames of 440 Hz tone, then 200 × 20ms frames of silence
+# = 2s ring, 4s quiet, repeating — matches standard PSTN ringback cadence.
+# ---------------------------------------------------------------------------
+def _make_ringback_cycle() -> list:
+    import struct as _s, audioop as _a, math as _m
+    frames = []
+    for i in range(100):          # 2 s of tone (100 × 20 ms)
+        pcm = _s.pack('<160h', *[
+            max(-32768, min(32767, int(0.7 * _m.sin(2 * _m.pi * 440 * (i * 160 + j) / 8000) * 32768)))
+            for j in range(160)
+        ])
+        frames.append(_a.lin2ulaw(pcm, 2))
+    sil = bytes([0x7F] * 160)
+    for _ in range(200):          # 4 s of silence (200 × 20 ms)
+        frames.append(sil)
+    return frames                 # 300-frame / 6-second ring cycle
+
+RINGBACK_CYCLE_PCMU = _make_ringback_cycle()
+
 # Validate required env vars at import time so failures are obvious
 if not os.getenv("LOCAL_AGENT") == "1":
     if not AGENT_RUNTIME_ARN:
@@ -2070,33 +2096,47 @@ class PbxBridge:
                 pass
 
     async def _rtp_keepalive(self, session, stop: asyncio.Event):
-        # BUG FIX: This task is now started AFTER WebRTC is up (moved from pre-
-        # establishment). It completely suppresses itself while the RTP output
-        # thread is running (_rtp_output_running flag). The output thread is the
-        # sole owner of seq/timestamp while active, sending silence on its own
-        # when the agent queue is empty. This eliminates the race where both tasks
-        # called next_rtp_header() concurrently and corrupted the RTP sequence stream.
+        # Sends audio to Chime while WebRTC is being established.
+        # Phase 1 (pre-WebRTC): plays a ringback tone (440 Hz, 2s on/4s off)
+        #   so the caller hears ringing instead of dead silence during AgentCore
+        #   cold-starts (which can take 15-30s on a fresh container).
+        # Phase 2 (post-WebRTC): suppresses itself entirely — the RTP output
+        #   thread takes over and sends silence when the agent queue is empty.
         log.info("RTP keepalive started  call-id=%.36s", session.call_id)
-        def _pkt():
-            sil = PCMA_SILENCE_FRAME if session.payload_type == RTP_PAYLOAD_PCMA else PCMU_SILENCE_FRAME
-            return session.next_rtp_header() + sil
-        # Initial punch-through to open NAT pinhole toward Chime
+
+        # Convert PCMU ringback cycle to PCMA if needed (rare outside Europe)
+        if session.payload_type == RTP_PAYLOAD_PCMA:
+            import audioop as _ao
+            ringback = [_ao.ulaw2alaw(f) for f in RINGBACK_CYCLE_PCMU]
+        else:
+            ringback = RINGBACK_CYCLE_PCMU
+
+        ring_idx = 0
+        interval = CHIME_FRAME_MS / 1000.0
+        dest = (session.remote_host, session.remote_rtp_port)
+
+        # Initial punch-through packet to open NAT pinhole
         try:
-            session.rtp_socket.sendto(_pkt(), (session.remote_host, session.remote_rtp_port))
+            session.rtp_socket.sendto(
+                session.next_rtp_header() + ringback[0], dest)
+            ring_idx = 1
         except OSError as e:
             log.warning("RTP punch-through error: %s", e)
-        interval = CHIME_FRAME_MS / 1000.0
+
         while not stop.is_set() and session.state != CallState.TEARING_DOWN:
             await asyncio.sleep(interval)
             if stop.is_set():
                 break
-            # Suppress entirely while the output thread owns the RTP stream
+            # Suppress entirely while the RTP output thread owns the stream
             if getattr(session, '_rtp_output_running', False):
                 continue
             try:
-                session.rtp_socket.sendto(_pkt(), (session.remote_host, session.remote_rtp_port))
+                frame = ringback[ring_idx % len(ringback)]
+                ring_idx += 1
+                session.rtp_socket.sendto(session.next_rtp_header() + frame, dest)
             except OSError:
                 break
+
         log.info("RTP keepalive ended  call-id=%.36s", session.call_id)
 
     async def _send_bye(self, session: CallSession, reason: str = ""):
