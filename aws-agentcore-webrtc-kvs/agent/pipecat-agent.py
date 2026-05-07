@@ -47,14 +47,14 @@ from pipecat.frames.frames import (
     FunctionCallsStartedFrame,
     FunctionCallResultFrame,    
     TTSStartedFrame,
-    MixerEnableFrame
-
+    MixerEnableFrame,
+    MixerUpdateSettingsFrame,
 )
 
 import uuid 
 from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
-
+import asyncio
 
 system_instructions="""
   You are a friendly but professional AI customer service agent for a lending company called Latrobe Financial. Latrobe financial provides loans to customers and your role is to verify the user, and ask how you can help them. You try to collect the information they provide and their concerns, and then will try to  help users with their questions and issues. However, your actual capabilities depend entirely on the tools available to you. Do not assume you can help with any specific request without first checking what tools you have access to. 
@@ -522,6 +522,36 @@ class StripInternalTagsProcessor(FrameProcessor):
         return ""
 
 
+class ToolSoundSwitcherProcessor(FrameProcessor):
+    """
+    Switches the mixer sound to 'keyboard_clicks' when a tool call starts,
+    and back to 'office' when the tool result is returned.
+
+    Listens for:
+      - FunctionCallsStartedFrame  → switch to keyboard_clicks
+      - FunctionCallResultFrame    → switch back to office
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, FunctionCallsStartedFrame):
+            logger.info("Tool call started — switching mixer to keyboard_clicks")
+            await self.push_frame(
+                MixerUpdateSettingsFrame(settings={"sound": "keyboard_clicks"}),
+                FrameDirection.DOWNSTREAM,
+            )
+
+        elif isinstance(frame, FunctionCallResultFrame):
+            logger.info("Tool call result received — switching mixer back to office")
+            await self.push_frame(
+                MixerUpdateSettingsFrame(settings={"sound": "office"}),
+                FrameDirection.DOWNSTREAM,
+            )
+
+        await self.push_frame(frame, direction)
+
+
 async def transfer_to_human_agent(params: FunctionCallParams):
     await params.llm.push_frame(TTSSpeakFrame("I'll now transfer you to our specialist human agents. G'day!"))
     await asyncio.sleep(3)
@@ -566,7 +596,7 @@ async def verify_user(params: FunctionCallParams):
         }
     )
 
-    await asyncio.sleep(5)  # testing keyboard sound
+    await asyncio.sleep(15)  # testing keyboard sound
     await params.result_callback({"user verified":"True"} )
 
 async def generate_and_send_statement(params: FunctionCallParams):
@@ -790,6 +820,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             user_aggregator,
             llm,
+            ToolSoundSwitcherProcessor(),
             StripInternalTagsProcessor(),
             tts,
             transport.output(),
