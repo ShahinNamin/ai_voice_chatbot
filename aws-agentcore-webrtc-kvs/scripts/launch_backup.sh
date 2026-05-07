@@ -35,6 +35,7 @@ if [ -f "vpc-config.env" ]; then
     sed -i.tmp "s/network_mode_config: null/network_mode_config:\\
           subnets:\\
             - $PRIVATE_SUBNET_1\\
+            - $PRIVATE_SUBNET_2\\
           security_groups:\\
             - $SG_ID/" .bedrock_agentcore.yaml
     rm -f .bedrock_agentcore.yaml.tmp
@@ -42,7 +43,7 @@ if [ -f "vpc-config.env" ]; then
     NETWORK_MODE="VPC"
     echo "✅ VPC configuration applied"
     echo "   VPC ID: $VPC_ID"
-    echo "   Private Subnets: $PRIVATE_SUBNET_1"
+    echo "   Private Subnets: $PRIVATE_SUBNET_1, $PRIVATE_SUBNET_2"
     echo "   Security Group: $SG_ID"
 else
     echo ""
@@ -152,7 +153,7 @@ echo ""
 if [ "$NETWORK_MODE" = "VPC" ]; then
     echo "Network Configuration: VPC Mode"
     echo "  - VPC ID: $VPC_ID"
-    echo "  - Private Subnets: $PRIVATE_SUBNET_1"
+    echo "  - Private Subnets: $PRIVATE_SUBNET_1, $PRIVATE_SUBNET_2"
     echo "  - NAT Gateway: $NAT_GW_ID"
     echo ""
 fi

@@ -6,6 +6,7 @@
 
 import os
 
+import time
 import boto3
 from bedrock_agentcore import BedrockAgentCoreApp
 from dotenv import load_dotenv
@@ -42,8 +43,19 @@ from pipecat.frames.frames import (
     Frame,
     LLMTextFrame,
     LLMFullResponseStartFrame,
+    FunctionCallInProgressFrame,
+    FunctionCallsStartedFrame,
+    FunctionCallResultFrame,    
+    TTSStartedFrame,
+    MixerEnableFrame
+
 )
+
 import uuid 
+from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
+from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
+
+
 system_instructions="""
   You are a friendly but professional AI customer service agent for a lending company called Latrobe Financial. Latrobe financial provides loans to customers and your role is to verify the user, and ask how you can help them. You try to collect the information they provide and their concerns, and then will try to  help users with their questions and issues. However, your actual capabilities depend entirely on the tools available to you. Do not assume you can help with any specific request without first checking what tools you have access to. 
 
@@ -359,6 +371,14 @@ system_instructions="""
   </instructions>
 
 """
+
+mixer = SoundfileMixer(
+    sound_files={"office": "australian_call_centre_1.wav", 'keyboard_clicks':'keyboard_clicks.wav'},
+    default_sound="office",
+    volume=0.2,
+    loop=True
+)
+
 class StripInternalTagsProcessor(FrameProcessor):
     """
     Strips <thinking>...</thinking> and <message>...</message> wrapper tags
@@ -502,15 +522,19 @@ class StripInternalTagsProcessor(FrameProcessor):
         return ""
 
 
-async def direct_to_human_agent(params: FunctionCallParams):
-    await params.result_callback({'action':'DirectToHumanAgent'})
-    await params.llm.push_frame(TTSSpeakFrame("Thanks for Calling, I'll now transfer you to our specialist human agents. Goodbye!"))
-    await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+async def transfer_to_human_agent(params: FunctionCallParams):
+    await params.llm.push_frame(TTSSpeakFrame("I'll now transfer you to our specialist human agents. G'day!"))
+    await asyncio.sleep(3)
+    await transport.send_message({"type": "call_ended"})
+    await params.llm.push_frame(EndFrame())
+    await params.result_callback({'action':'TransferToHumanAgent'})
 
 async def end_customer_call(params: FunctionCallParams):
+    # await params.llm.llm.push_frame(EndTaskFrame())
+    await transport.send_message({"type": "call_ended"})
+    await task.queue_frame(EndFrame())
     await params.result_callback({'action':'EndCustomerCall'})
-    await params.llm.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-
+    
 async def verify_user(params: FunctionCallParams):
     table_name = "connect_chime_call_metadata"
 
@@ -542,6 +566,7 @@ async def verify_user(params: FunctionCallParams):
         }
     )
 
+    await asyncio.sleep(5)  # testing keyboard sound
     await params.result_callback({"user verified":"True"} )
 
 async def generate_and_send_statement(params: FunctionCallParams):
@@ -621,7 +646,9 @@ def get_kvs_ice_servers():
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
+        # audio_in_filter=RNNoiseFilter(), # This adds too much latency, not worth it.
         audio_out_enabled=True,
+        audio_out_mixer=mixer
     ),
 }
 
@@ -644,10 +671,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-        # sample_rate=16000,
         settings=ElevenLabsTTSService.Settings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
-            model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
+            # model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
             
         ),
     )
@@ -665,14 +691,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    llm.register_function("direct_to_human_agent",direct_to_human_agent ) 
+    llm.register_function("transfer_to_human_agent",transfer_to_human_agent ) 
     llm.register_function("end_customer_call",end_customer_call)
     llm.register_function("verify_user",verify_user)
     llm.register_function("generate_and_send_statement", generate_and_send_statement)
 
-    direct_to_human_agent_function = FunctionSchema(
-        name="direct_to_human_agent" , 
-        description = "if the user has requests beyond the AI Agent's responsibilities, or if they explicitly mention that they want to talk to a human agent, this tool needs to be called",
+    transfer_to_human_agent_function = FunctionSchema(
+        name="transfer_to_human_agent" , 
+        description = "Transfer the customer to the human agent. This needs to be done if explicitly asked, if the customer is a broker, or if their enquiries are not within the scope of what you can assist with. Once you call this tool, make sure to end the call by calling the end_customer_call tool right after, so that the customer service agent can take over the call and assist the user further.",
         properties={
         },
         required=[],
@@ -727,23 +753,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         name = "generate_and_send_statement",
         description="This will generate the bank statement / transaction records and will email it to the user. Make sure you confirm with the user if it is ok to generate and send their statement.",
         properties={
-            # "startDate": 
-            # {
-            #     "type":"string", 
-            #     "description":"start date to generate the user's statement from. Note that this can be passed as an empty string, or a date, or a relative date, such as 3 months ago, a year ago, etc."
-            # } , 
-            # "endDate": 
-            # {
-            #     "type": "string",
-            #     "description":"end date to generate the user's statement till. Note that this can be passed as Now, or a date of any sort."
-            # }
+            "startDate": 
+            {
+                "type":"string", 
+                "description":"start date to generate the user's statement from. Note that this can be passed as an empty string, or a date, or a relative date, such as 3 months ago, a year ago, etc."
+            } , 
+            "endDate": 
+            {
+                "type": "string",
+                "description":"end date to generate the user's statement till. Note that this can be passed as Now, or a date of any sort."
+            }
 
         } , 
-        required=[]
+        required=['startDate','endDate']
 
     )
 
-    tools = ToolsSchema(standard_tools=[ direct_to_human_agent_function , end_customer_call_function,verify_user_function , generate_and_send_statement_function])
+    tools = ToolsSchema(standard_tools=[ transfer_to_human_agent_function , end_customer_call_function,verify_user_function , generate_and_send_statement_function])
 
 
     context = LLMContext(tools=tools)
@@ -754,6 +780,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             vad_analyzer=SileroVADAnalyzer(),
         ),
     )
+
+    
+
 
     pipeline = Pipeline(
         [
@@ -777,6 +806,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
     )
 
+    
+
+
     @task.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         logger.info(f"Client ready")
@@ -785,6 +817,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             {"role": "user", "content": "Say hello and briefly introduce yourself."}
         )
         await task.queue_frames([LLMRunFrame()])
+        # await task.queue_frame(TTSSpeakFrame("Hello, This is Latrobe financial's AI assistant. How can I help you today?"))
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
@@ -819,6 +852,9 @@ async def initialize_connection_and_run_bot(request: SmallWebRTCRequest):
         runner_args = SmallWebRTCRunnerArguments(
             webrtc_connection=connection, body=request.request_data
         )
+
+        runner_args.pipeline_idle_timeout_secs=20
+
         transport = await create_transport(runner_args, transport_params)
 
     yield {"status": "initializing connection"}
