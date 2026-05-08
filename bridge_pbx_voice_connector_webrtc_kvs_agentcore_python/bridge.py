@@ -888,6 +888,10 @@ class ChimeAudioReceiverSink:
                 except Exception as e:
                     log.warning("WebRTC audio track recv error: %s  call-id=%.36s",
                                 e, session.call_id)
+                    # Agent closed the WebRTC connection — mark it so _run_call
+                    # knows to send a SIP BYE to Chime.
+                    if session.disconnect_reason == "unknown":
+                        session.disconnect_reason = "agent closed WebRTC"
                     break
 
                 session.webrtc_frames_rx       += 1
@@ -1101,7 +1105,7 @@ class ChimeAudioReceiverSink:
 # AgentCore WebRTC signaling
 # ---------------------------------------------------------------------------
 
-async def _establish_webrtc(session: CallSession) -> bool:
+async def _establish_webrtc(session: CallSession, bridge: "PbxBridge" = None) -> bool:
     """
     Perform the WebRTC signaling dance with the Pipecat agent on AgentCore.
 
@@ -1175,10 +1179,48 @@ async def _establish_webrtc(session: CallSession) -> bool:
             log.warning("WebRTC: failed to send client-ready: %s  call-id=%.36s",
                         _e, call_id)
 
+    # Mutable cell so the dc.on("message") closure can reach the bridge instance
+    # even though _establish_webrtc is a module-level function.
+    _bridge_ref = [bridge]
+
     @dc.on("message")
     def _on_dc_message(msg):
-        log.debug("WebRTC: data channel msg: %.120s  call-id=%.36s",
-                  msg if isinstance(msg, str) else repr(msg), call_id)
+        """
+        Handle RTVI messages from the Pipecat agent over the data channel.
+
+        When Pipecat decides to end the call it sends one of these RTVI events
+        before (or while) closing the WebRTC peer connection:
+          - { "label": "rtvi-ai", "type": "bot-stopped" }
+          - { "label": "rtvi-ai", "type": "bot-disconnected" }
+
+        As soon as we see one of those we send a SIP BYE to Chime immediately
+        — this cuts the PSTN hangup latency from "wait for WebRTC teardown +
+        Chime inactivity timer (~seconds)" down to sub-second.
+        """
+        import json as _json
+        text = msg if isinstance(msg, str) else (msg.decode("utf-8", errors="replace") if isinstance(msg, (bytes, bytearray)) else repr(msg))
+        log.debug("WebRTC: data channel msg: %.120s  call-id=%.36s", text, call_id)
+        try:
+            m = _json.loads(text)
+            label = m.get("label", "")
+            mtype = m.get("type", "")
+            if label == "rtvi-ai" and mtype in ("bot-stopped", "bot-disconnected"):
+                log.info("WebRTC: RTVI %s received — sending SIP BYE immediately  call-id=%.36s",
+                         mtype, call_id)
+                # Retrieve the live session; it may have already been torn down.
+                # We access it from the enclosing _establish_webrtc scope via the
+                # session variable that was closed over (session is in scope here).
+                if session.state != CallState.TEARING_DOWN:
+                    session.disconnect_reason = f"agent {mtype} (RTVI)"
+                    session.state = CallState.TEARING_DOWN
+                    # Schedule teardown on the event loop (dc callbacks are sync).
+                    asyncio.get_event_loop().call_soon_threadsafe(
+                        lambda: asyncio.ensure_future(
+                            _bridge_ref[0]._teardown_with_bye(session)
+                        )
+                    )
+        except Exception:
+            pass
 
     ice_candidates_to_send: asyncio.Queue = asyncio.Queue()
 
@@ -1715,7 +1757,7 @@ class PbxBridge:
         try:
             # --- Establish WebRTC connection to AgentCore ----------------------
             log.info("Establishing WebRTC connection to AgentCore  call-id=%.36s", call_id)
-            ok = await _establish_webrtc(session)
+            ok = await _establish_webrtc(session, bridge=self)
             if not ok:
                 session.disconnect_reason = f"WebRTC establishment failed: {session.webrtc_close_reason}"
                 return
@@ -1765,9 +1807,26 @@ class PbxBridge:
                 if t is not None:
                     t.cancel()
             _emit_disconnect_report(session)
-            silent_hangup = "RTP silence" in session.disconnect_reason
-            await self._teardown(call_id, send_bye=silent_hangup,
-                                 bye_reason="RTP-timeout" if silent_hangup else "")
+            silent_hangup  = "RTP silence" in session.disconnect_reason
+            agent_hangup   = "agent" in session.disconnect_reason  # RTVI bot-stopped or WebRTC close
+            chime_initiated = any(x in session.disconnect_reason
+                                  for x in ("SIP BYE", "SIP CANCEL", "SIP 481", "RTP silence"))
+            # Send BYE to Chime whenever WE are the side initiating the teardown
+            # (agent hung up, or RTP silence timeout) — but NOT when Chime already
+            # sent BYE/CANCEL to us (they know the call is over).
+            # Also send BYE if WebRTC closed and the reason is still "unknown"
+            # (agent closed without sending an RTVI event first).
+            should_bye = (silent_hangup or agent_hangup or
+                          (session.disconnect_reason == "unknown" and
+                           session.state == CallState.TEARING_DOWN and
+                           not chime_initiated))
+            if should_bye and session.state != CallState.TEARING_DOWN:
+                session.state = CallState.TEARING_DOWN
+            bye_reason_str = ("RTP-timeout" if silent_hangup
+                              else "agent-hangup" if agent_hangup
+                              else "")
+            await self._teardown(call_id, send_bye=should_bye,
+                                 bye_reason=bye_reason_str)
 
     async def _wait_for_track_and_run_sink(self, session, pc, sink, stop):
         """Poll until a remote audio track appears then hand off to the sink."""
@@ -2246,6 +2305,16 @@ class PbxBridge:
                      proto, session.call_id, reason or "normal")
         except Exception as e:
             log.warning("Failed to send BYE  call-id=%.36s : %s", session.call_id, e)
+
+    async def _teardown_with_bye(self, session: CallSession):
+        """
+        Convenience wrapper: send SIP BYE then tear down the session.
+        Called when the agent initiates the hangup (RTVI bot-stopped or WebRTC
+        closed while Chime side is still alive).
+        """
+        call_id = session.call_id
+        await self._send_bye(session, reason="agent-hangup")
+        await self._teardown(call_id, send_bye=False)  # BYE already sent above
 
     async def _teardown(self, call_id: str, send_bye: bool = False, bye_reason: str = ""):
         session = self.sessions.pop(call_id, None)
