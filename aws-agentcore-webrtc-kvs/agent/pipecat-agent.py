@@ -49,6 +49,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     MixerEnableFrame,
     MixerUpdateSettingsFrame,
+    EndTaskFrame
 )
 
 import uuid 
@@ -622,29 +623,29 @@ class ToolSoundSwitcherProcessor(FrameProcessor):
             logger.info("Tool call started — switching mixer to keyboard_clicks")
             await self.push_frame(
                 MixerUpdateSettingsFrame(settings={"sound": "keyboard_clicks"}),
-                FrameDirection.DOWNSTREAM,
+                direction,
             )
 
         elif isinstance(frame, FunctionCallResultFrame):
             logger.info("Tool call result received — switching mixer back to office")
             await self.push_frame(
                 MixerUpdateSettingsFrame(settings={"sound": "office"}),
-                FrameDirection.DOWNSTREAM,
+                direction,
             )
-
+        
         await self.push_frame(frame, direction)
 
 
 async def transfer_to_human_agent(params: FunctionCallParams):
     await params.llm.push_frame(TTSSpeakFrame("I'll now transfer you to our specialist human agents. G'day!"))
     await asyncio.sleep(3)
-    await params.llm.push_frame(EndFrame())
+    await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
     await params.result_callback({'action':'TransferToHumanAgent'})
 
 async def end_customer_call(params: FunctionCallParams):
     # await params.llm.llm.push_frame(EndTaskFrame())
-    await params.llm.push_frame(EndFrame())
-    await task.queue_frame(EndFrame())
+    await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+    
     await params.result_callback({'action':'EndCustomerCall'})
     
 async def verify_user(params: FunctionCallParams):
