@@ -55,13 +55,16 @@ import uuid
 from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 import asyncio
+import re
 
 system_instructions="""
   You are a friendly but professional AI customer service agent for a lending company called Latrobe Financial. Latrobe financial provides loans to customers and your role is to verify the user, and ask how you can help them. You try to collect the information they provide and their concerns, and then will try to  help users with their questions and issues. However, your actual capabilities depend entirely on the tools available to you. Do not assume you can help with any specific request without first checking what tools you have access to. 
 
   IMPORTANT: Being labeled as a "customer service agent" does NOT mean you have general customer service capabilities. You can only help with tasks that your available tools support. Do not claim abilities you cannot verify through your tools.
   
-   Note: You can add some emotions to your text in the text. For this, you can just add any of these emotional tags: [laughs], [laughs harder], [starts laughing], [wheezing] , [whispers] , [sighs], [exhales] , [sarcastic], [curious], [excited], [crying], [snorts], [mischievously]. If you use the tag, that emotion will be used for the whole sentence from that point on. So make sure the sentence ends (with a period: . ) The next sentence after . (period), will not carry that emotion. Similarly, you can also use Ellipses (…) to add pauses and weight. 
+   Note: You can add some emotions to your text in the text. For this, you can just add any of these emotional tags: [laughs], [laughs harder], [starts laughing], [wheezing] , [whispers] , [sighs], [exhales] , [sarcastic], [curious], [excited], [crying], [snorts], [mischievously]. If you use the tag, that emotion will be used for the whole sentence that follows the tag. So make sure the sentence ends (with a period: . ) The next sentence after . (period), will not carry that emotion. Similarly, you can also use Ellipses (…) to add pauses and weight.
+
+   Note: Thinking tags are not part of these emotion tags, they come after message tags. Your communication with the outside world has the format: <message> Message to read to the customer </message> <thinking> your way of processing the information </thinking> 
   
     NOte: Try to use these emotions and styles of talking sporadically, don't fill your sentences with them. If none of these appear, the tone will be normal. 
 
@@ -364,6 +367,8 @@ system_instructions="""
   I can help you with your account. Let me look up your information.
   </message>
 
+  
+
   <instructions>
   Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: en-au (Australian).
   </instructions>
@@ -520,6 +525,86 @@ class StripInternalTagsProcessor(FrameProcessor):
         return ""
 
 
+class EmotionTagFilterProcessor(FrameProcessor):
+    """
+    Filters out LLM text frames whose content is *only* a bracketed emotion tag,
+    e.g. "[excited]" or "[whispers]", which the LLM sometimes emits as standalone tokens.
+
+    If the tag appears as part of a larger utterance — e.g. "I'm glad I could help [excited]"
+    — it is passed through unchanged.
+
+    Strategy: accumulate LLMTextFrame tokens into a buffer. When a natural flush point
+    arrives (LLMFullResponseStartFrame signals end of previous turn, or any non-LLMTextFrame
+    downstream frame), flush the buffer. Before flushing each token we check whether the
+    *entire* pending text (stripped) matches a bracketed-tag pattern — if so, we drop it.
+    Because the LLM streams token-by-token we instead track a rolling "current segment"
+    and suppress it only when we can confirm it is solely a bracketed tag with no surrounding text.
+    """
+
+    # Matches a string that is *only* one bracketed tag (possibly with surrounding whitespace)
+    _SOLO_TAG_RE = None  # initialised below the class definition
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._pending_text = ""   # accumulated text for the current LLM segment
+
+    def _is_solo_emotion_tag(self, text: str) -> bool:
+        return bool(self._SOLO_TAG_RE.match(text))
+
+    async def _flush(self, direction: FrameDirection):
+        """Emit the accumulated text as a single LLMTextFrame, unless it's a solo tag."""
+        text = self._pending_text
+        self._pending_text = ""
+        if not text:
+            return
+        if self._is_solo_emotion_tag(text):
+            logger.debug(f"EmotionTagFilterProcessor: suppressing solo emotion tag: {text!r}")
+            return
+        await self.push_frame(LLMTextFrame(text=text), direction)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMTextFrame):
+            self._pending_text += frame.text
+            # Check eagerly: if accumulated text clearly has content beyond any tag, flush now
+            # so we don't introduce unnecessary latency for normal speech.
+            if not self._might_be_solo_tag(self._pending_text):
+                await self._flush(direction)
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            # New response starting — flush anything leftover from the previous turn
+            await self._flush(direction)
+            self._pending_text = ""
+            await self.push_frame(frame, direction)
+        else:
+            # Any other frame type: flush pending text first, then pass the frame through
+            await self._flush(direction)
+            await self.push_frame(frame, direction)
+
+    def _might_be_solo_tag(self, text: str) -> bool:
+        """
+        Returns True if the accumulated text *could still* become a solo tag
+        (i.e. we should keep buffering), False if it definitely has other content.
+        """
+        stripped = text.strip()
+        if not stripped:
+            return True   # empty so far — keep buffering
+        # If there's no '[' at all, it's definitely plain text — flush immediately
+        if "[" not in stripped:
+            return False
+        # If it starts with '[' and hasn't closed yet, it might still be a solo tag
+        if stripped.startswith("[") and "]" not in stripped:
+            return True   # incomplete tag — keep buffering
+        # If it matches the solo pattern already — keep buffering until we're sure nothing follows
+        if self._SOLO_TAG_RE.match(stripped):
+            return True
+        # Otherwise there's clearly more content around the tag — flush immediately
+        return False
+
+
+EmotionTagFilterProcessor._SOLO_TAG_RE = re.compile(r"^\s*\[[^\[\]]+\]\s*$")
+
+
 class ToolSoundSwitcherProcessor(FrameProcessor):
     """
     Switches the mixer sound to 'keyboard_clicks' when a tool call starts,
@@ -553,13 +638,12 @@ class ToolSoundSwitcherProcessor(FrameProcessor):
 async def transfer_to_human_agent(params: FunctionCallParams):
     await params.llm.push_frame(TTSSpeakFrame("I'll now transfer you to our specialist human agents. G'day!"))
     await asyncio.sleep(3)
-    await transport.send_message({"type": "call_ended"})
     await params.llm.push_frame(EndFrame())
     await params.result_callback({'action':'TransferToHumanAgent'})
 
 async def end_customer_call(params: FunctionCallParams):
     # await params.llm.llm.push_frame(EndTaskFrame())
-    await transport.send_message({"type": "call_ended"})
+    await params.llm.push_frame(EndFrame())
     await task.queue_frame(EndFrame())
     await params.result_callback({'action':'EndCustomerCall'})
     
@@ -674,7 +758,7 @@ def get_kvs_ice_servers():
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
-        # audio_in_filter=RNNoiseFilter(), # This adds too much latency, not worth it.
+        audio_in_filter=RNNoiseFilter(), # This adds too much latency, not worth it.
         audio_out_enabled=True,
         audio_out_mixer=mixer
     ),
@@ -820,6 +904,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             llm,
             ToolSoundSwitcherProcessor(),
             StripInternalTagsProcessor(),
+            EmotionTagFilterProcessor(),
             tts,
             transport.output(),
             assistant_aggregator,
