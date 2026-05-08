@@ -364,8 +364,6 @@ system_instructions="""
   I can help you with your account. Let me look up your information.
   </message>
 
-  
-
   <instructions>
   Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: en-au (Australian).
   </instructions>
@@ -596,7 +594,7 @@ async def verify_user(params: FunctionCallParams):
         }
     )
 
-    await asyncio.sleep(15)  # testing keyboard sound
+    await asyncio.sleep(5)  # testing keyboard sound
     await params.result_callback({"user verified":"True"} )
 
 async def generate_and_send_statement(params: FunctionCallParams):
@@ -884,7 +882,7 @@ async def initialize_connection_and_run_bot(request: SmallWebRTCRequest):
             webrtc_connection=connection, body=request.request_data
         )
 
-        runner_args.pipeline_idle_timeout_secs=20
+        runner_args.pipeline_idle_timeout_secs=120
 
         transport = await create_transport(runner_args, transport_params)
 
