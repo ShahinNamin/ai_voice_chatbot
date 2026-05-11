@@ -1001,7 +1001,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
     silence_detector = UserSilenceDetectorProcessor(
-        silence_timeout_secs=20.0,
+        silence_timeout_secs=10.0,
         max_checkins=2,
     )
 
