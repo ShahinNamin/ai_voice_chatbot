@@ -1303,7 +1303,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
         settings=ElevenLabsTTSService.Settings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
-            model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
+            # model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
             
         ),
     )
