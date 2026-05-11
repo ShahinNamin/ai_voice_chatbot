@@ -1469,6 +1469,15 @@ class PbxBridge:
                     await self._ack_reinvite_200(transport, msg_parsed, session, addr, cid, cseq)
                 else:
                     log.info("SIP 200 OK (no active session)  call-id=%s", cid)
+            elif status_code == 200 and msg_parsed and "BYE" in cseq:
+                # Chime acknowledged our BYE — the PSTN leg is now terminated.
+                # _retransmit_bye will stop because the session is being torn down.
+                log.info("SIP 200 OK for BYE [%s]  call-id=%s — Chime confirmed hangup",
+                         proto, cid)
+                session = self.sessions.get(cid)
+                if session and session.state != CallState.TEARING_DOWN:
+                    session.state = CallState.TEARING_DOWN
+                    asyncio.create_task(self._teardown(cid, send_bye=False))
             elif status_code == 481:
                 log.warning("SIP 481 [%s] from %s:%d  call-id=%s — tearing down",
                             proto, addr[0], addr[1], cid)
@@ -2282,29 +2291,133 @@ class PbxBridge:
             return
         proto = session.sip_proto
         try:
+            session.sip_cseq += 1
             branch = "z9hG4bK%08x" % random.randint(0, 0xFFFFFFFF)
-            to_hdr = session.sip_from_hdr
-            if session.to_tag and "tag=" not in to_hdr:
-                to_hdr = f"{to_hdr};tag={session.to_tag}"
+
+            # ----------------------------------------------------------------
+            # From/To in a BYE must mirror the original INVITE dialog:
+            #   From:  our UAS identity (what Chime sent as "To" in INVITE)
+            #   To:    Chime's identity  (what Chime sent as "From" in INVITE)
+            # sip_from_hdr was set from INVITE "To" header  (our side)
+            # sip_to_hdr   was set from INVITE "From" header (Chime side)
+            # ----------------------------------------------------------------
+            from_hdr = session.sip_from_hdr
+            if session.to_tag and "tag=" not in from_hdr:
+                from_hdr = f"{from_hdr};tag={session.to_tag}"
+
             reason_hdr = f"Reason: SIP;cause=200;text=\"{reason}\"\r\n" if reason else ""
             contact_transport = f";transport={proto.lower()}" if proto == "TCP" else ""
+
+            # ----------------------------------------------------------------
+            # Request-URI: use remote Contact URI from the dialog, NOT the
+            # bare remote host.  Chime sets Contact to its VC FQDN; sending
+            # BYE to the raw IP often hits a different Chime node that has no
+            # record of the dialog and silently drops or 481s the request.
+            # ----------------------------------------------------------------
+            contact_hdr = session.sip_remote_contact or ""
+            if "<" in contact_hdr and ">" in contact_hdr:
+                req_uri = contact_hdr[contact_hdr.index("<") + 1: contact_hdr.index(">")]
+            else:
+                req_uri = f"sip:{session.remote_host}"
+
+            # ----------------------------------------------------------------
+            # Route set: in-dialog requests MUST follow the Record-Route path
+            # established during the INVITE (reversed, as per RFC 3261 §12.2).
+            # Without this, the BYE can arrive at a Chime node that has no
+            # dialog state and gets silently dropped — leaving the PSTN leg
+            # active until Chime's inactivity timer fires (~30-60 s).
+            # ----------------------------------------------------------------
+            routes = list(reversed(session.sip_record_route))
+            route_hdrs = "".join(f"Route: {r}\r\n" for r in routes)
+
+            # Determine send address: first route hop if routes present,
+            # otherwise fall back to the Contact URI host, then sip_remote_addr.
+            if routes:
+                first_route = routes[0]
+                dest_uri = (first_route[first_route.index("<") + 1: first_route.index(">")]
+                            if "<" in first_route else first_route.split(";")[0])
+                dest_part = dest_uri.replace("sip:", "").split(";")[0]
+                if ":" in dest_part:
+                    d_host, d_port_s = dest_part.rsplit(":", 1)
+                    d_port = int(d_port_s) if d_port_s.isdigit() else 5060
+                else:
+                    d_host, d_port = dest_part, 5060
+                send_addr = (d_host, d_port)
+            elif "<" in contact_hdr and ">" in contact_hdr:
+                # No Route set — use Contact host directly (RFC 3261 §12.2.1.1)
+                contact_uri = req_uri  # already extracted above
+                c_part = contact_uri.replace("sip:", "").split(";")[0]
+                if ":" in c_part:
+                    c_host, c_port_s = c_part.rsplit(":", 1)
+                    c_port = int(c_port_s) if c_port_s.isdigit() else 5060
+                else:
+                    c_host, c_port = c_part, 5060
+                send_addr = (c_host, c_port)
+            else:
+                send_addr = session.sip_remote_addr
+
             bye = (
-                f"BYE sip:{session.remote_host} SIP/2.0\r\n"
+                f"BYE {req_uri} SIP/2.0\r\n"
                 f"Via: SIP/2.0/{proto} {self._local_ip}:{SIP_PORT};branch={branch};rport\r\n"
-                f"From: {to_hdr}\r\n"
+                f"From: {from_hdr}\r\n"
                 f"To: {session.sip_to_hdr}\r\n"
                 f"Call-ID: {session.call_id}\r\n"
                 f"CSeq: {session.sip_cseq} BYE\r\n"
                 f"Contact: <sip:pbx@{self._local_ip}:{SIP_PORT}{contact_transport}>\r\n"
                 f"Max-Forwards: 70\r\n"
+                f"{route_hdrs}"
                 f"{reason_hdr}"
                 f"Content-Length: 0\r\n\r\n"
             )
-            session.sip_transport.sendto(bye.encode(), session.sip_remote_addr)
-            log.info("Sent BYE [%s]  call-id=%.36s  reason=%s",
-                     proto, session.call_id, reason or "normal")
+            bye_bytes = bye.encode()
+            session.sip_transport.sendto(bye_bytes, send_addr)
+            log.info("Sent BYE [%s]  call-id=%.36s  dest=%s:%d  reason=%s",
+                     proto, session.call_id, send_addr[0], send_addr[1], reason or "normal")
+
+            # ----------------------------------------------------------------
+            # RFC 3261 §17.1.2 retransmission for UDP (TCP is reliable).
+            # Non-INVITE requests must be retransmitted with timer T1 doubling
+            # up to T2 (4s) until a final response is received or 64*T1 elapses.
+            # Without this, a single lost UDP packet silently leaves the PSTN
+            # leg active.  We retransmit up to 6 times (covers ~32s) and stop
+            # as soon as Chime replies 200 OK (which handle_sip already processes).
+            # ----------------------------------------------------------------
+            if proto == "UDP":
+                asyncio.ensure_future(
+                    self._retransmit_bye(bye_bytes, send_addr, session.call_id)
+                )
         except Exception as e:
             log.warning("Failed to send BYE  call-id=%.36s : %s", session.call_id, e)
+
+    async def _retransmit_bye(self, bye_bytes: bytes, send_addr: tuple, call_id: str):
+        """
+        Retransmit a BYE request per RFC 3261 §17.1.2 until Chime responds or
+        the session is gone (meaning we received the 200 OK and tore down).
+
+        Timer sequence: 500ms, 1s, 2s, 4s, 4s, 4s  (T1=500ms, cap at T2=4s).
+        Stops early if the session has already been removed from self.sessions
+        (i.e. teardown completed, which means we got a 200 OK for the BYE).
+        """
+        T1 = 0.5   # RFC 3261 T1 = 500 ms
+        T2 = 4.0   # RFC 3261 T2 = 4 s
+        t  = T1
+        for attempt in range(1, 7):   # up to 6 retransmits (~15.5s total wait)
+            await asyncio.sleep(t)
+            if call_id not in self.sessions:
+                log.debug("BYE retransmit: session gone after %d attempt(s)  call-id=%.36s",
+                          attempt, call_id)
+                return
+            session = self.sessions.get(call_id)
+            if session is None or session.state == CallState.TEARING_DOWN:
+                return
+            try:
+                session.sip_transport.sendto(bye_bytes, send_addr)
+                log.debug("BYE retransmit #%d  call-id=%.36s  dest=%s:%d",
+                          attempt, call_id, send_addr[0], send_addr[1])
+            except Exception as e:
+                log.debug("BYE retransmit failed: %s  call-id=%.36s", e, call_id)
+                return
+            t = min(t * 2, T2)
 
     async def _teardown_with_bye(self, session: CallSession):
         """
