@@ -47,6 +47,9 @@ from pipecat.frames.frames import (
     FunctionCallsStartedFrame,
     FunctionCallResultFrame,    
     TTSStartedFrame,
+    TTSSpeakFrame,
+    BotStoppedSpeakingFrame,
+    UserStartedSpeakingFrame,
     MixerEnableFrame,
     MixerUpdateSettingsFrame,
     EndTaskFrame
@@ -606,6 +609,106 @@ class EmotionTagFilterProcessor(FrameProcessor):
 EmotionTagFilterProcessor._SOLO_TAG_RE = re.compile(r"^\s*\[[^\[\]]+\]\s*$")
 
 
+class UserSilenceDetectorProcessor(FrameProcessor):
+    """
+    Detects when the user has been silent for too long after the bot finishes speaking.
+
+    - Starts a countdown timer when the bot stops speaking (BotStoppedSpeakingFrame).
+    - Resets the timer if the user starts speaking (UserStartedSpeakingFrame).
+    - If the silence threshold is reached, pushes a TTSSpeakFrame with a check-in prompt
+      and resets the counter. After a configurable number of unanswered check-ins it
+      gives a final farewell and ends the task.
+
+    Args:
+        silence_timeout_secs: Seconds of user silence before the first check-in (default 20).
+        max_checkins: How many check-ins to attempt before hanging up (default 2).
+    """
+
+    CHECKIN_MESSAGES = [
+        "Are you still there? I'm here whenever you're ready to continue.",
+        "Just checking in — I haven't heard from you in a little while. Take your time, I'm still here.",
+    ]
+    FAREWELL_MESSAGE = (
+        "It seems like you may have stepped away. I'll go ahead and end the call for now. "
+        "Feel free to ring back whenever you need assistance. Have a great day!"
+    )
+
+    def __init__(self, silence_timeout_secs: float = 20.0, max_checkins: int = 2, **kwargs):
+        super().__init__(**kwargs)
+        self._silence_timeout_secs = silence_timeout_secs
+        self._max_checkins = max_checkins
+        self._checkin_count = 0
+        self._timer_task: asyncio.Task | None = None
+        self._bot_speaking = False
+
+    # ------------------------------------------------------------------
+    # Timer helpers
+    # ------------------------------------------------------------------
+
+    def _cancel_timer(self):
+        if self._timer_task and not self._timer_task.done():
+            self._timer_task.cancel()
+            self._timer_task = None
+
+    def _start_timer(self):
+        self._cancel_timer()
+        self._timer_task = asyncio.create_task(self._silence_timer())
+
+    async def _silence_timer(self):
+        try:
+            await asyncio.sleep(self._silence_timeout_secs)
+            await self._on_silence_timeout()
+        except asyncio.CancelledError:
+            pass
+
+    async def _on_silence_timeout(self):
+        if self._checkin_count < self._max_checkins:
+            msg = self.CHECKIN_MESSAGES[
+                min(self._checkin_count, len(self.CHECKIN_MESSAGES) - 1)
+            ]
+            self._checkin_count += 1
+            logger.info(
+                f"UserSilenceDetector: silence timeout ({self._checkin_count}/{self._max_checkins}) — sending check-in"
+            )
+            # Push UPSTREAM so the frame travels back through TTS to be spoken
+            await self.push_frame(TTSSpeakFrame(msg), FrameDirection.UPSTREAM)
+            # Restart timer so we catch continued silence after the check-in
+            self._start_timer()
+        else:
+            logger.info("UserSilenceDetector: max check-ins reached — ending call")
+            await self.push_frame(TTSSpeakFrame(self.FAREWELL_MESSAGE), FrameDirection.UPSTREAM)
+            await asyncio.sleep(6)  # give TTS time to finish before ending
+            await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+    # ------------------------------------------------------------------
+    # Frame processing
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStoppedSpeakingFrame):
+            # Bot finished its turn — start watching for user silence
+            self._bot_speaking = False
+            self._start_timer()
+
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # User is responding — cancel timer and reset check-in counter
+            self._cancel_timer()
+            self._checkin_count = 0
+
+        elif isinstance(frame, TTSStartedFrame):
+            # Bot started speaking — pause the silence timer while it talks
+            self._bot_speaking = True
+            self._cancel_timer()
+
+        await self.push_frame(frame, direction)
+
+    async def cleanup(self):
+        self._cancel_timer()
+        await super().cleanup()
+
+
 class ToolSoundSwitcherProcessor(FrameProcessor):
     """
     Switches the mixer sound to 'keyboard_clicks' when a tool call starts,
@@ -795,8 +898,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # AgentCore Runtime, or from environment variables when running locally.
     llm = AWSBedrockLLMService(
         settings=AWSBedrockLLMService.Settings(
-            # model="anthropic.claude-3-haiku-20240307-v1:0",
-            model="amazon.nova-pro-v1:0",
+            model="au.anthropic.claude-haiku-4-5-20251001-v1:0",  # cross-region inference profile required for this model
+            # model="amazon.nova-pro-v1:0",
             # model="anthropic.claude-3-sonnet-20240229-v1:0",
             temperature=0.8,
             # system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
@@ -897,6 +1000,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     
 
 
+    silence_detector = UserSilenceDetectorProcessor(
+        silence_timeout_secs=20.0,
+        max_checkins=2,
+    )
+
     pipeline = Pipeline(
         [
             transport.input(),
@@ -907,6 +1015,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             StripInternalTagsProcessor(),
             EmotionTagFilterProcessor(),
             tts,
+            silence_detector,       # sits after TTS so it sees BotStoppedSpeakingFrame
             transport.output(),
             assistant_aggregator,
         ]
