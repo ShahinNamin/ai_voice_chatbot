@@ -6,12 +6,15 @@
 
 import os
 
+from datetime import datetime, timezone
+
 import time
 import boto3
 from bedrock_agentcore import BedrockAgentCoreApp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -21,6 +24,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
     LLMUserAggregatorParams,
 )
+# SmartTurnParams: disables the local end-of-turn ML model on the STT service.
+# If this import fails after a pipecat upgrade, check:
+#   pipecat.audio.turn.smart_turn.base_smart_turn  (older builds)
+#   pipecat.audio.turn.smart_turn                  (newer builds)
+# and look for SmartTurnParams or a boolean enable_smart_turn kwarg on
+# ElevenLabsRealtimeSTTService.Settings instead.
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.aws.llm import AWSBedrockLLMService
@@ -50,10 +60,17 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     BotStoppedSpeakingFrame,
     UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     MixerEnableFrame,
     MixerUpdateSettingsFrame,
-    EndTaskFrame
+    EndTaskFrame,
+    InputAudioRawFrame,
+    OutputAudioRawFrame,
 )
+import io
+import wave
+import struct
+from datetime import datetime, timezone
 
 import uuid 
 from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
@@ -609,6 +626,176 @@ class EmotionTagFilterProcessor(FrameProcessor):
 EmotionTagFilterProcessor._SOLO_TAG_RE = re.compile(r"^\s*\[[^\[\]]+\]\s*$")
 
 
+class TranscriptGracePeriodProcessor(FrameProcessor):
+    """
+    Hybrid turn-completion guard: sits between the STT service and the user
+    aggregator and adds a short semantic grace period when a transcript looks
+    incomplete (i.e. ends mid-clause), before allowing the turn to be committed.
+
+    Why this exists
+    ---------------
+    Pure VAD-silence turn detection closes the turn as soon as the audio goes
+    quiet. That works well for complete utterances but can fire prematurely when
+    the caller pauses mid-thought (e.g. "I want to check my…"). This processor
+    intercepts UserStoppedSpeakingFrame (which VAD emits when silence is
+    detected) and, if the most recent transcript looks unfinished, waits up to
+    `grace_period_secs` for the user to resume speaking before forwarding the
+    frame. If the user does resume (UserStartedSpeakingFrame arrives), the
+    held frame is discarded — VAD will emit a fresh UserStoppedSpeakingFrame
+    when they stop again. If the grace period expires with no new speech, the
+    held frame is forwarded and the turn commits normally.
+
+    Incomplete-utterance heuristic
+    --------------------------------
+    A transcript is considered incomplete if its last non-whitespace characters
+    match any of the INCOMPLETE_ENDINGS patterns:
+      - Ends with a coordinating conjunction or preposition: "and", "but", "or",
+        "to", "for", "of", "in", "on", "with", "my", "the", "a", "an", "their",
+        "your", "our", "its", "this", "that", "these", "those"
+      - Ends with a comma (mid-list pause)
+      - Ends mid-word (no terminal punctuation and last word < 3 chars, which
+        catches fragments like "I", "a", "is")
+
+    The heuristic deliberately errs on the side of *not* holding — only clear
+    incomplete signals trigger the grace period, so well-formed complete
+    sentences flow through without any added latency.
+
+    Args:
+        grace_period_secs: How long to wait before committing an incomplete turn
+                           (default 1.2s — enough for a natural mid-thought pause).
+    """
+
+    # Words that strongly suggest the utterance is not yet complete
+    _DANGLING_WORDS = {
+        "and", "but", "or", "nor", "so", "yet",   # coordinating conjunctions
+        "to", "for", "of", "in", "on", "at",       # common prepositions
+        "with", "by", "from", "about", "into",
+        "my", "your", "our", "their", "its",       # possessives
+        "the", "a", "an",                           # articles
+        "this", "that", "these", "those",          # demonstratives
+        "which", "who", "where", "when", "what",   # relative pronouns
+        "if", "because", "although", "while",      # subordinating conjunctions
+        "i", "we", "they", "he", "she",            # subject pronouns (fragmented start)
+    }
+
+    def __init__(self, grace_period_secs: float = 1.2, **kwargs):
+        super().__init__(**kwargs)
+        self._grace_period_secs = grace_period_secs
+        self._latest_transcript: str = ""
+        self._held_frame: Frame | None = None
+        self._grace_task: asyncio.Task | None = None
+
+    # ------------------------------------------------------------------
+    # Transcript tracking — updated from TranscriptionFrame if available,
+    # otherwise approximated from LLMTextFrame (not ideal but a safe fallback)
+    # ------------------------------------------------------------------
+
+    def _update_transcript(self, text: str):
+        self._latest_transcript = text.strip()
+
+    def _looks_incomplete(self) -> bool:
+        """Return True if the transcript appears to end mid-utterance."""
+        text = self._latest_transcript
+        if not text:
+            return False
+
+        # Strip trailing whitespace and inspect the last token
+        stripped = text.rstrip()
+
+        # Ends with a comma — clearly mid-list
+        if stripped.endswith(","):
+            return True
+
+        # Extract the last word (lowercase, no punctuation)
+        last_word = re.split(r"\s+", stripped)[-1].lower()
+        last_word_clean = re.sub(r"[^a-z'-]", "", last_word)
+
+        # Last word is a known dangling word
+        if last_word_clean in self._DANGLING_WORDS:
+            return True
+
+        # Last word is very short and utterance has no terminal punctuation
+        # (catches single-letter fragments: "I", "a")
+        if len(last_word_clean) <= 2 and not re.search(r"[.!?]$", stripped):
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Grace period timer
+    # ------------------------------------------------------------------
+
+    def _cancel_grace(self):
+        if self._grace_task and not self._grace_task.done():
+            self._grace_task.cancel()
+        self._grace_task = None
+
+    async def _run_grace_period(self, frame: Frame, direction: FrameDirection):
+        try:
+            await asyncio.sleep(self._grace_period_secs)
+            # Grace period expired with no new speech — commit the turn
+            logger.debug(
+                f"TranscriptGracePeriod: grace expired, committing turn "
+                f"(transcript={self._latest_transcript!r})"
+            )
+            self._held_frame = None
+            await self.push_frame(frame, direction)
+        except asyncio.CancelledError:
+            pass  # user resumed speaking — frame was already discarded
+
+    # ------------------------------------------------------------------
+    # Frame processing
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        # Track the latest transcript from the STT service.
+        # Pipecat exposes TranscriptionFrame for final STT results; import it
+        # defensively so the processor still works if the frame type changes.
+        try:
+            from pipecat.frames.frames import TranscriptionFrame
+            if isinstance(frame, TranscriptionFrame):
+                self._update_transcript(frame.text)
+        except ImportError:
+            pass
+
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            if self._looks_incomplete():
+                # Hold the frame and start the grace period
+                logger.debug(
+                    f"TranscriptGracePeriod: incomplete transcript detected "
+                    f"({self._latest_transcript!r}) — holding for {self._grace_period_secs}s"
+                )
+                self._held_frame = frame
+                self._cancel_grace()
+                self._grace_task = asyncio.create_task(
+                    self._run_grace_period(frame, direction)
+                )
+                # Do NOT push the frame yet — return early
+                return
+            else:
+                # Transcript looks complete — pass through immediately
+                self._cancel_grace()
+                self._held_frame = None
+
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # User resumed — discard any held turn-close frame
+            if self._held_frame is not None:
+                logger.debug(
+                    "TranscriptGracePeriod: user resumed speaking — discarding held UserStoppedSpeakingFrame"
+                )
+                self._cancel_grace()
+                self._held_frame = None
+                self._latest_transcript = ""  # reset so next stop is evaluated fresh
+
+        await self.push_frame(frame, direction)
+
+    async def cleanup(self):
+        self._cancel_grace()
+        await super().cleanup()
+
+
 class UserSilenceDetectorProcessor(FrameProcessor):
     """
     Detects when the user has been silent for too long after the bot finishes speaking.
@@ -708,6 +895,166 @@ class UserSilenceDetectorProcessor(FrameProcessor):
         self._cancel_timer()
         await super().cleanup()
 
+class AudioRecorderProcessor(FrameProcessor):
+    """
+    Taps both legs of the call and writes a stereo WAV to S3 when the
+    pipeline ends.
+
+    * Left channel  = caller (InputAudioRawFrame)
+    * Right channel = bot    (OutputAudioRawFrame)
+
+    Upload is triggered in one of two ways:
+      1. upload() is called explicitly -- used by tool functions (transfer /
+         end-call) so the file is saved before EndTaskFrame shuts things down.
+      2. cleanup() falls back to upload() for all other endings (idle timeout,
+         client disconnect).
+
+    Environment variables
+    ---------------------
+    RECORDINGS_S3_BUCKET  -- destination bucket name (required)
+    """
+
+    _OUT_SAMPLE_RATE: int = 16_000
+    _OUT_CHANNELS: int = 2
+    _OUT_SAMPLE_WIDTH: int = 2  # 16-bit PCM
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._bucket: str = os.environ.get("RECORDINGS_S3_BUCKET", "")
+        self._in_buf: bytearray = bytearray()   # caller PCM (left channel)
+        self._out_buf: bytearray = bytearray()  # bot PCM    (right channel)
+        self._started_at: str = ""
+        self._uploaded: bool = False             # guard against double-upload
+        if not self._bucket:
+            logger.warning(
+                "AudioRecorderProcessor: RECORDINGS_S3_BUCKET is not set -- "
+                "audio will be buffered but NOT uploaded."
+            )
+        else:
+            logger.info(f"AudioRecorderProcessor: will upload to s3://{self._bucket}/recordings/")
+
+    # ------------------------------------------------------------------
+    # Frame handling
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InputAudioRawFrame):
+            if not self._started_at:
+                self._started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                logger.debug(f"AudioRecorderProcessor: recording started ({self._started_at})")
+            self._in_buf.extend(
+                self._resample(frame.audio, frame.sample_rate, self._OUT_SAMPLE_RATE)
+            )
+
+        elif isinstance(frame, OutputAudioRawFrame):
+            if not self._started_at:
+                self._started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                logger.debug(f"AudioRecorderProcessor: recording started ({self._started_at})")
+            self._out_buf.extend(
+                self._resample(frame.audio, frame.sample_rate, self._OUT_SAMPLE_RATE)
+            )
+
+        await self.push_frame(frame, direction)
+
+    async def cleanup(self):
+        """Safety-net upload for idle-timeout / client-disconnect endings."""
+        in_secs  = len(self._in_buf)  // (self._OUT_SAMPLE_WIDTH * self._OUT_SAMPLE_RATE)
+        out_secs = len(self._out_buf) // (self._OUT_SAMPLE_WIDTH * self._OUT_SAMPLE_RATE)
+        logger.info(
+            f"AudioRecorderProcessor: cleanup -- "
+            f"caller ~{in_secs}s buffered, bot ~{out_secs}s buffered"
+        )
+        await self.upload()
+        await super().cleanup()
+
+    # ------------------------------------------------------------------
+    # Public upload API
+    # ------------------------------------------------------------------
+
+    async def upload(self):
+        """Upload the buffered audio to S3.
+
+        Safe to call multiple times -- only the first call does work.
+        Tool functions (transfer_to_human_agent, end_customer_call) call
+        this directly before pushing EndTaskFrame so the file is saved
+        regardless of which direction the shutdown frame travels.
+        """
+        if self._uploaded:
+            logger.debug("AudioRecorderProcessor: upload() called but already uploaded, skipping")
+            return
+        if not (self._in_buf or self._out_buf):
+            logger.warning("AudioRecorderProcessor: upload() called but buffers are empty")
+            return
+        self._uploaded = True
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._upload_recording)
+        except Exception as exc:
+            logger.error(f"AudioRecorderProcessor: upload error -- {exc}")
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _resample(self, audio: bytes, src_rate: int, dst_rate: int) -> bytes:
+        """Nearest-neighbour resample for 16-bit mono PCM."""
+        if src_rate == dst_rate:
+            return audio
+        n_src = len(audio) // 2
+        if n_src == 0:
+            return b""
+        samples = struct.unpack(f"<{n_src}h", audio)
+        n_dst = max(1, int(n_src * dst_rate / src_rate))
+        out = [samples[int(i * n_src / n_dst)] for i in range(n_dst)]
+        return struct.pack(f"<{n_dst}h", *out)
+
+    def _interleave(self, left: bytes, right: bytes) -> bytes:
+        """Interleave two mono 16-bit PCM buffers into one stereo buffer."""
+        L = struct.unpack(f"<{len(left)  // 2}h", left)
+        R = struct.unpack(f"<{len(right) // 2}h", right)
+        n = max(len(L), len(R))
+        L = L + (0,) * (n - len(L))
+        R = R + (0,) * (n - len(R))
+        stereo = [s for pair in zip(L, R) for s in pair]
+        return struct.pack(f"<{len(stereo)}h", *stereo)
+
+    def _build_wav(self) -> bytes:
+        """Build a complete in-memory stereo WAV file."""
+        pcm = self._interleave(bytes(self._in_buf), bytes(self._out_buf))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(self._OUT_CHANNELS)
+            wf.setsampwidth(self._OUT_SAMPLE_WIDTH)
+            wf.setframerate(self._OUT_SAMPLE_RATE)
+            wf.writeframes(pcm)
+        return buf.getvalue()
+
+    def _upload_recording(self):
+        """Blocking S3 upload -- called via run_in_executor."""
+        if not self._bucket:
+            logger.warning("AudioRecorderProcessor: skipping -- RECORDINGS_S3_BUCKET not set")
+            return
+        timestamp = self._started_at or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        key = f"recordings/{timestamp}.wav"
+        try:
+            wav_bytes = self._build_wav()
+            s3 = boto3.client("s3")
+            s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=wav_bytes,
+                ContentType="audio/wav",
+            )
+            duration_secs = len(self._in_buf) // (self._OUT_SAMPLE_WIDTH * self._OUT_SAMPLE_RATE)
+            logger.info(
+                f"AudioRecorderProcessor: uploaded s3://{self._bucket}/{key} "
+                f"({len(wav_bytes):,} bytes, ~{duration_secs}s)"
+            )
+        except Exception as exc:
+            logger.error(f"AudioRecorderProcessor: S3 upload failed -- {exc}")
+
 
 class ToolSoundSwitcherProcessor(FrameProcessor):
     """
@@ -742,20 +1089,59 @@ class ToolSoundSwitcherProcessor(FrameProcessor):
 async def transfer_to_human_agent(params: FunctionCallParams):
     await params.llm.push_frame(TTSSpeakFrame("I'll now transfer you to our specialist human agents. G'day!"))
     await asyncio.sleep(3)
+    dynamodb = boto3.resource("dynamodb")
+    table_name = os.getenv("ACTIONS_TABLE")
+    table = dynamodb.Table(table_name)
+    contact_id = params.arguments.get("contactId")
+    if contact_id is None or contact_id =='': #TODO: Change later based on the contact ID from amazon connect
+        contact_id = str(uuid.uuid4())
+
+    now = datetime.now()
+
+    formatted_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    response = table.put_item(
+        Item = {
+            "contact_id": contact_id,
+            "action": "transfer_to_human_agent",
+            "timestamp" : formatted_timestamp
+        }
+    )
+
+    # Upload the call recording before ending the task -- EndTaskFrame only
+    # travels upstream from the LLM so it never reaches audio_recorder's
+    # cleanup(). Calling upload() directly is the reliable solution.
+    await audio_recorder.upload()
     await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
     await params.result_callback({'action':'TransferToHumanAgent'})
 
 async def end_customer_call(params: FunctionCallParams):
     # await params.llm.llm.push_frame(EndTaskFrame())
+    dynamodb = boto3.resource("dynamodb")
+    table_name = os.getenv("ACTIONS_TABLE")
+    table = dynamodb.Table(table_name)
+    contact_id = params.arguments.get("contactId")
+    if contact_id is None or contact_id =='': #TODO: Change later based on the contact ID from amazon connect
+        contact_id = str(uuid.uuid4())
+
+    now = datetime.now()
+
+    formatted_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    response = table.put_item(
+        Item = {
+            "contact_id": contact_id,
+            "action": "call_ended",
+            "timestamp" : formatted_timestamp
+        }
+    )
+    # Upload the call recording before ending the task -- EndTaskFrame only
+    # travels upstream from the LLM so it never reaches audio_recorder's
+    # cleanup(). Calling upload() directly is the reliable solution.
+    await audio_recorder.upload()
     await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-    
     await params.result_callback({'action':'EndCustomerCall'})
     
 async def verify_user(params: FunctionCallParams):
     table_name = "connect_chime_call_metadata"
-
-    
-
     full_name = params.arguments.get("fullName")
     address = params.arguments.get("address")
     phone_number = params.arguments.get("phoneNumber")
@@ -785,6 +1171,7 @@ async def verify_user(params: FunctionCallParams):
     await asyncio.sleep(5)  # testing keyboard sound
     await params.result_callback({"user verified":"True"} )
 
+
 async def generate_and_send_statement(params: FunctionCallParams):
     await params.result_callback({"outcome": "the statement or transaction report was generated and was sent to the user. Please allow up to 5 minutes to receive the email in the user's inbox"})
 
@@ -794,6 +1181,7 @@ async def generate_and_send_statement(params: FunctionCallParams):
 app = BedrockAgentCoreApp()
 
 request_handler: SmallWebRTCRequestHandler = None
+audio_recorder: "AudioRecorderProcessor" = None  # set in run_bot; used by tool functions
 
 load_dotenv(override=True)
 
@@ -862,7 +1250,18 @@ def get_kvs_ice_servers():
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
-        audio_in_filter=RNNoiseFilter(), # This adds too much latency, not worth it.
+        # RNNoiseFilter automatically resamples 16kHz Chime telephony audio up
+        # to 48kHz (RNNoise's required rate) via SOXRStreamAudioResampler, then
+        # back down after processing. "MQ" (medium quality) resampling is used
+        # instead of the default "QQ" (quick) because 16kHz→48kHz is a 3x
+        # upsample — QQ introduces audible artefacts at that ratio which can
+        # confuse the STT. MQ adds ~1-2ms latency, which is acceptable.
+        #
+        # IMPORTANT: requires soxr to be installed in the container:
+        #   pip install pipecat-ai[silero]  (pulls in soxr as a dependency)
+        # If soxr is missing, RNNoise silently disables itself and audio passes
+        # through unfiltered — check logs for "Could not import SOXRStreamAudioResampler".
+        audio_in_filter=RNNoiseFilter(resampler_quality="MQ"),
         audio_out_enabled=True,
         audio_out_mixer=mixer
     ),
@@ -883,16 +1282,32 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     #     ),
     # )
 
-    stt = ElevenLabsRealtimeSTTService(api_key=os.environ["ELEVENLABS_API_KEY"])
+    # Disable the smart turn model on the STT service.
+    #
+    # By default, ElevenLabsRealtimeSTTService enables a local SmartTurn model
+    # that tries to detect natural end-of-turn from partial transcripts. In poor
+    # audio conditions (background noise, hesitant speech, short fragments) it
+    # repeatedly returns EndOfTurnState.INCOMPLETE and never commits the turn.
+    # When VAD silence eventually forces the turn to close, pipecat discards the
+    # accumulated transcript (logs show "strategy: None"), so the LLM is never
+    # called and the bot goes silent.
+    #
+    # Setting enabled=False makes the STT rely solely on VAD silence to end the
+    # turn, which is more reliable for telephony-grade audio.
+    stt = ElevenLabsRealtimeSTTService(
+        api_key=os.environ["ELEVENLABS_API_KEY"],
+        smart_turn_params=SmartTurnParams(enabled=False),
+    )
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
         settings=ElevenLabsTTSService.Settings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
-            # model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
+            model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
             
         ),
     )
+
 
     # Automatically uses credentials from assumed IAM role when running in
     # AgentCore Runtime, or from environment variables when running locally.
@@ -914,7 +1329,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     transfer_to_human_agent_function = FunctionSchema(
         name="transfer_to_human_agent" , 
-        description = "Transfer the customer to the human agent. This needs to be done if explicitly asked, if the customer is a broker, or if their enquiries are not within the scope of what you can assist with. Once you call this tool, make sure to end the call by calling the end_customer_call tool right after, so that the customer service agent can take over the call and assist the user further.",
+        description = "Transfer the customer to the human agent. This needs to be done if explicitly asked, if the customer is a broker, or if their enquiries are not within the scope of what you can assist with. As a result of this, the call with the AI agent will terminate and it will be transferred to a specialist human agent that assists the user with their enquiries.",
         properties={
         },
         required=[],
@@ -993,22 +1408,37 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            # Tuned for telephony-grade audio.
+            # - stop_secs: 0.8s of silence required before the turn closes.
+            #   The Silero default (~0.3s) is too aggressive for callers who
+            #   pause mid-thought; 0.8s gives natural speech room to breathe
+            #   without adding noticeable latency for prompt speakers.
+            # - start_secs: 0.2s of speech required before VAD transitions to
+            #   SPEAKING state, reducing false triggers from background noise.
+            vad_analyzer=SileroVADAnalyzer(
+                params=VADParams(
+                    stop_secs=0.8,
+                    start_secs=0.2,
+                )
+            ),
         ),
     )
 
     
-
+    global audio_recorder
+    audio_recorder = AudioRecorderProcessor()
 
     silence_detector = UserSilenceDetectorProcessor(
-        silence_timeout_secs=10.0,
+        silence_timeout_secs=20.0,
         max_checkins=2,
     )
+
 
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
+            TranscriptGracePeriodProcessor(grace_period_secs=1.2),
             user_aggregator,
             llm,
             ToolSoundSwitcherProcessor(),
@@ -1018,6 +1448,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             silence_detector,       # sits after TTS so it sees BotStoppedSpeakingFrame
             transport.output(),
             assistant_aggregator,
+            audio_recorder,         # LAST: sees Input/OutputAudioRawFrame in both directions
         ]
     )
 
