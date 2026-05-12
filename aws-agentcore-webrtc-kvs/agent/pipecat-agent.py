@@ -170,6 +170,8 @@ system_instructions="""
   Your reasoning process can go here if needed for complex decisions.
   </thinking>
 
+  CRITICAL ORDERING RULE: Your very first output token MUST be `<message>`. You must NEVER begin a response with `<thinking>` or any other tag. The `<thinking>` block, if used, always comes AFTER the closing `</message>` tag. Violating this rule causes the caller to hear silence for several seconds while thinking tokens are discarded.
+
   MUST NEVER put thinking content inside message tags.
   MUST always start with `<message>` tags, even when using tools, to let the customer know you are working to resolve their issue.
   
@@ -445,6 +447,8 @@ system_instructions="""
 
   <instructions>
   Now, based on the examples and instructions above, start your message to the customer with an opening <message> tag. Keep your initial message as a brief acknowledgment of their request, but avoid making claims about capabilities in your initial message. Use <thinking> tags after your initial message to review your actual available tools and assess your capabilities accurately. Respond in the following language locale: en-au (Australian).
+
+  REMINDER: Your response MUST begin with `<message>` as the very first token. Never output `<thinking>` first.
   </instructions>
 
 """
@@ -481,12 +485,16 @@ class StripInternalTagsProcessor(FrameProcessor):
         self._buffer = ""          # accumulates partial tag text across tokens
         self._skipping = False     # True when inside a SKIP tag
         self._skip_tag = None      # which skip tag we're currently inside
+        self._response_start_t: float | None = None  # monotonic time of LLMFullResponseStartFrame
+        self._thinking_warned: bool = False           # only warn once per turn
+        self._seen_any_content: bool = False          # True once any non-tag token has arrived
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMFullResponseStartFrame):
             self._reset()
+            self._response_start_t = _time.monotonic()
             await self.push_frame(frame, direction)
 
         elif isinstance(frame, LLMTextFrame):
@@ -499,8 +507,27 @@ class StripInternalTagsProcessor(FrameProcessor):
                         f"LATENCY | first LLM token to TTS: {((_latency.t1_llm_first_token - _latency.t0_vad_stop)*1000):.0f}ms"
                         f" | token={cleaned!r}"
                     )
+                self._seen_any_content = True
                 await self.push_frame(LLMTextFrame(text=cleaned), direction)
-            # If cleaned is empty, swallow the frame — don't push empty tokens
+            else:
+                # Token was suppressed (thinking block or tag). Check if the LLM
+                # front-loaded a <thinking> block before <message>, which causes
+                # multi-second silence for the caller.
+                if (
+                    not self._thinking_warned
+                    and self._response_start_t is not None
+                    and self._skipping
+                    and self._skip_tag == "thinking"
+                    and not self._seen_any_content
+                ):
+                    elapsed_ms = (_time.monotonic() - self._response_start_t) * 1000
+                    if elapsed_ms > 500:
+                        self._thinking_warned = True
+                        logger.warning(
+                            f"LATENCY | StripInternalTags: LLM opened with <thinking> before <message>"
+                            f" — caller has heard silence for {elapsed_ms:.0f}ms so far."
+                            f" Check system prompt ordering rule."
+                        )
 
         else:
             await self.push_frame(frame, direction)
@@ -751,6 +778,15 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         self._held_frame: Frame | None = None
         self._grace_task: asyncio.Task | None = None
         self._bot_is_speaking: bool = False  # bypass grace when interrupting
+        self._last_transcript_t: float | None = None  # monotonic time of last TranscriptionFrame
+        self._turn_start_t: float | None = None        # monotonic time of last UserStartedSpeakingFrame
+        # Debounce: after a UserStoppedSpeaking commits a turn to the LLM, suppress
+        # any further UserStoppedSpeaking frames for this many seconds. This prevents
+        # rapid back-to-back transcripts (ElevenLabs sometimes splits a single long
+        # utterance into 2–3 consecutive committed transcripts) from interrupting the
+        # LLM response that was just triggered.
+        self._turn_commit_debounce_secs: float = 2.0
+        self._last_turn_commit_t: float | None = None  # monotonic time of last commit
 
     # ------------------------------------------------------------------
     # Transcript tracking — updated from TranscriptionFrame if available,
@@ -759,6 +795,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
 
     def _update_transcript(self, text: str):
         self._latest_transcript = text.strip()
+        self._last_transcript_t = _time.monotonic()
 
     def _looks_incomplete(self) -> bool:
         """Return True if the transcript appears to end mid-utterance."""
@@ -809,6 +846,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
             # T0: VAD stop committed to LLM (after grace delay)
             _latency.reset()
             _latency.t0_vad_stop = _time.monotonic()
+            self._last_turn_commit_t = _time.monotonic()
             self._held_frame = None
             await self.push_frame(frame, direction)
         except asyncio.CancelledError:
@@ -839,6 +877,31 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
             self._bot_is_speaking = False
 
         if isinstance(frame, UserStoppedSpeakingFrame):
+            # Warn if the turn completed with no transcript — strong signal that
+            # speech was swallowed during an STT reconnect.
+            if not self._latest_transcript and self._turn_start_t is not None:
+                turn_dur_ms = (_time.monotonic() - self._turn_start_t) * 1000
+                logger.warning(
+                    f"STT-RECONNECT | UserStoppedSpeaking with EMPTY transcript"
+                    f" (turn duration {turn_dur_ms:.0f}ms) — speech was likely lost"
+                    f" during an ElevenLabs STT reconnect. The LLM will receive no input."
+                )
+
+            # Debounce: if we just committed a turn within the last N seconds and the
+            # bot is NOT currently speaking (i.e. this is not a genuine interruption),
+            # suppress this frame. ElevenLabs sometimes delivers a second committed
+            # transcript 50–200ms after the first for the same long utterance, which
+            # would otherwise interrupt the LLM response we just triggered.
+            if not self._bot_is_speaking and self._last_turn_commit_t is not None:
+                secs_since_commit = _time.monotonic() - self._last_turn_commit_t
+                if secs_since_commit < self._turn_commit_debounce_secs:
+                    logger.info(
+                        f"DEBOUNCE | Suppressing UserStoppedSpeaking {secs_since_commit*1000:.0f}ms"
+                        f" after last commit (debounce={self._turn_commit_debounce_secs*1000:.0f}ms)"
+                        f" — transcript={self._latest_transcript!r}"
+                    )
+                    return  # drop the frame; LLM is already processing the previous turn
+
             # If the bot is/was speaking when the user stopped, this is an
             # interruption — commit the turn immediately without any grace delay
             # so the pipeline cancels TTS and processes the interrupt ASAP.
@@ -852,6 +915,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 self._bot_is_speaking = False
                 _latency.reset()
                 _latency.t0_vad_stop = _time.monotonic()
+                self._last_turn_commit_t = _time.monotonic()
                 await self.push_frame(frame, direction)
                 return
 
@@ -877,10 +941,24 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 # T0: VAD stop committed to LLM (no grace delay)
                 _latency.reset()
                 _latency.t0_vad_stop = _time.monotonic()
+                self._last_turn_commit_t = _time.monotonic()
                 self._cancel_grace()
                 self._held_frame = None
 
         elif isinstance(frame, UserStartedSpeakingFrame):
+            self._turn_start_t = _time.monotonic()
+            # Warn if STT likely reconnected just before/during this turn.
+            # Heuristic: if the last committed transcript is >3s old (or never arrived)
+            # and the bot is not speaking, the STT may have cycled its session and
+            # any speech captured during the reconnect window (~400ms) will be lost.
+            if not self._bot_is_speaking and self._last_transcript_t is not None:
+                gap_since_last_transcript = (_time.monotonic() - self._last_transcript_t) * 1000
+                if gap_since_last_transcript > 3000:
+                    logger.warning(
+                        f"STT-RECONNECT | UserStartedSpeaking but last transcript was"
+                        f" {gap_since_last_transcript:.0f}ms ago — STT may have reconnected."
+                        f" If next turn has no transcript, speech was lost during reconnect."
+                    )
             # User resumed — discard any held turn-close frame
             if self._held_frame is not None:
                 logger.debug(
@@ -1646,13 +1724,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             #   SPEAKING state, reducing false triggers from background noise.
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.6,
+                    stop_secs=0.3,
                     start_secs=0.2,
                 )
             ),
         ),
     )
-    logger.info("VAD config: stop_secs=0.6  start_secs=0.2")
+    logger.info("VAD config: stop_secs=0.3  start_secs=0.2")
 
     
     global audio_recorder
