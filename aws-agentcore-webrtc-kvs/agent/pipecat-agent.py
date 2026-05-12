@@ -780,13 +780,22 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         self._bot_is_speaking: bool = False  # bypass grace when interrupting
         self._last_transcript_t: float | None = None  # monotonic time of last TranscriptionFrame
         self._turn_start_t: float | None = None        # monotonic time of last UserStartedSpeakingFrame
-        # Debounce: after a UserStoppedSpeaking commits a turn to the LLM, suppress
-        # any further UserStoppedSpeaking frames for this many seconds. This prevents
-        # rapid back-to-back transcripts (ElevenLabs sometimes splits a single long
-        # utterance into 2–3 consecutive committed transcripts) from interrupting the
-        # LLM response that was just triggered.
-        self._turn_commit_debounce_secs: float = 2.0
+        # Debounce: suppress split transcripts from ElevenLabs. ElevenLabs sometimes
+        # delivers 2–3 committed transcripts within ~300ms for a single long utterance,
+        # each triggering a UserStoppedSpeaking. The second and third would interrupt
+        # the LLM response already triggered by the first.
+        #
+        # Detection heuristic: a split transcript arrives WITHOUT a UserStartedSpeaking
+        # in between (the user never stopped and restarted — it was one continuous
+        # utterance). We track whether a new UserStartedSpeaking has been seen since
+        # the last commit. If not, and we're within a short time window, it's a split.
+        #
+        # This is strictly better than a pure time window because genuine rapid turns
+        # (user speaks, pauses, speaks again quickly) always produce a UserStartedSpeaking
+        # in between, so they are never suppressed here.
+        self._turn_commit_debounce_secs: float = 0.5  # narrow window: splits arrive within ~300ms
         self._last_turn_commit_t: float | None = None  # monotonic time of last commit
+        self._new_start_since_commit: bool = True      # True if UserStartedSpeaking seen since last commit
 
     # ------------------------------------------------------------------
     # Transcript tracking — updated from TranscriptionFrame if available,
@@ -847,6 +856,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
             _latency.reset()
             _latency.t0_vad_stop = _time.monotonic()
             self._last_turn_commit_t = _time.monotonic()
+            self._new_start_since_commit = False
             self._held_frame = None
             await self.push_frame(frame, direction)
         except asyncio.CancelledError:
@@ -887,17 +897,19 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                     f" during an ElevenLabs STT reconnect. The LLM will receive no input."
                 )
 
-            # Debounce: if we just committed a turn within the last N seconds and the
-            # bot is NOT currently speaking (i.e. this is not a genuine interruption),
-            # suppress this frame. ElevenLabs sometimes delivers a second committed
-            # transcript 50–200ms after the first for the same long utterance, which
-            # would otherwise interrupt the LLM response we just triggered.
-            if not self._bot_is_speaking and self._last_turn_commit_t is not None:
+            # Debounce: suppress split transcripts. A split arrives without a
+            # UserStartedSpeaking in between AND within a short time window.
+            # Genuine new turns always have a UserStartedSpeaking, so they pass through.
+            if (
+                not self._bot_is_speaking
+                and self._last_turn_commit_t is not None
+                and not self._new_start_since_commit
+            ):
                 secs_since_commit = _time.monotonic() - self._last_turn_commit_t
                 if secs_since_commit < self._turn_commit_debounce_secs:
                     logger.info(
-                        f"DEBOUNCE | Suppressing UserStoppedSpeaking {secs_since_commit*1000:.0f}ms"
-                        f" after last commit (debounce={self._turn_commit_debounce_secs*1000:.0f}ms)"
+                        f"DEBOUNCE | Suppressing split transcript {secs_since_commit*1000:.0f}ms"
+                        f" after last commit (no UserStartedSpeaking in between)"
                         f" — transcript={self._latest_transcript!r}"
                     )
                     return  # drop the frame; LLM is already processing the previous turn
@@ -916,6 +928,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 _latency.reset()
                 _latency.t0_vad_stop = _time.monotonic()
                 self._last_turn_commit_t = _time.monotonic()
+                self._new_start_since_commit = False
                 await self.push_frame(frame, direction)
                 return
 
@@ -942,11 +955,41 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 _latency.reset()
                 _latency.t0_vad_stop = _time.monotonic()
                 self._last_turn_commit_t = _time.monotonic()
+                self._new_start_since_commit = False
                 self._cancel_grace()
                 self._held_frame = None
 
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._turn_start_t = _time.monotonic()
+
+            # Detect whether this UserStartedSpeaking is a real VAD event or a
+            # synthetic one fired by TranscriptionUserTurnStartStrategy when a second
+            # split transcript arrives. The synthetic one arrives within ~300ms of
+            # the previous commit with no real audio gap.
+            #
+            # If it looks like a split, DROP both this frame and the paired
+            # UserStoppedSpeaking (gate stays False). This prevents the LLM from
+            # being interrupted mid-response by a trailing fragment of the same
+            # utterance. The transcript text still reaches the context via
+            # TranscriptionFrame which passes through independently.
+            if (
+                not self._bot_is_speaking
+                and self._last_turn_commit_t is not None
+                and not self._new_start_since_commit
+            ):
+                secs_since_commit = _time.monotonic() - self._last_turn_commit_t
+                if secs_since_commit < self._turn_commit_debounce_secs:
+                    logger.info(
+                        f"DEBOUNCE | Dropping split-transcript UserStartedSpeaking"
+                        f" {secs_since_commit*1000:.0f}ms after last commit"
+                        f" — paired UserStoppedSpeaking will also be suppressed"
+                    )
+                    # Do NOT push, do NOT set _new_start_since_commit = True.
+                    # The follow-up UserStoppedSpeaking will be suppressed by the
+                    # debounce check since _new_start_since_commit remains False.
+                    return
+
+            self._new_start_since_commit = True  # genuine new turn — reset debounce gate
             # Warn if STT likely reconnected just before/during this turn.
             # Heuristic: if the last committed transcript is >3s old (or never arrived)
             # and the bot is not speaking, the STT may have cycled its session and
