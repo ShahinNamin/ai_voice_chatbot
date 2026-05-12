@@ -713,8 +713,9 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         "to", "for", "of", "in", "on", "with", "my", "the", "a", "an", "their",
         "your", "our", "its", "this", "that", "these", "those"
       - Ends with a comma (mid-list pause)
-      - Ends mid-word (no terminal punctuation and last word < 3 chars, which
-        catches fragments like "I", "a", "is")
+      - Ends mid-word (no terminal punctuation and last word < 2 chars, which
+        catches single-character fragments like "I" or "a" but NOT short complete
+        words like "is", "ok", "hi", "no", "go", etc.)
 
     The heuristic deliberately errs on the side of *not* holding — only clear
     incomplete signals trigger the grace period, so well-formed complete
@@ -722,23 +723,28 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
 
     Args:
         grace_period_secs: How long to wait before committing an incomplete turn
-                           (default 1.2s — enough for a natural mid-thought pause).
+                           (default 0.5s — tight but enough for a natural mid-thought
+                           pause without introducing noticeable dead air on telephony).
     """
 
-    # Words that strongly suggest the utterance is not yet complete
+    # Words that strongly suggest the utterance is not yet complete.
+    # Kept intentionally narrow: only words that are virtually never the last
+    # word of a complete sentence. Subject pronouns (i, we, they, he, she),
+    # relative pronouns (which, who, where, when, what), subordinating
+    # conjunctions (if, because, although, while), and common prepositions
+    # (at, by, from, about, into) have been removed — they frequently appear
+    # at the end of complete telephony utterances (e.g. "Yes, that's me",
+    # "What can I help you with", "I'm calling about") and caused unnecessary
+    # grace-period delays on those turns.
     _DANGLING_WORDS = {
-        "and", "but", "or", "nor", "so", "yet",   # coordinating conjunctions
-        "to", "for", "of", "in", "on", "at",       # common prepositions
-        "with", "by", "from", "about", "into",
-        "my", "your", "our", "their", "its",       # possessives
-        "the", "a", "an",                           # articles
+        "and", "but", "or", "nor",                 # coordinating conjunctions
+        "to", "for", "of", "in", "on", "with",     # high-signal prepositions only
+        "my", "your", "our", "their", "its",       # possessives (never end a sentence)
+        "the", "a", "an",                           # articles (never end a sentence)
         "this", "that", "these", "those",          # demonstratives
-        "which", "who", "where", "when", "what",   # relative pronouns
-        "if", "because", "although", "while",      # subordinating conjunctions
-        "i", "we", "they", "he", "she",            # subject pronouns (fragmented start)
     }
 
-    def __init__(self, grace_period_secs: float = 1.2, **kwargs):
+    def __init__(self, grace_period_secs: float = 0.5, **kwargs):
         super().__init__(**kwargs)
         self._grace_period_secs = grace_period_secs
         self._latest_transcript: str = ""
@@ -775,9 +781,10 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         if last_word_clean in self._DANGLING_WORDS:
             return True
 
-        # Last word is very short and utterance has no terminal punctuation
-        # (catches single-letter fragments: "I", "a")
-        if len(last_word_clean) <= 2 and not re.search(r"[.!?]$", stripped):
+        # Last word is a single character and utterance has no terminal punctuation
+        # (catches bare "I" or "a" fragments; deliberately excludes 2-char words
+        # like "is", "ok", "hi", "no", "go" which are valid sentence endings)
+        if len(last_word_clean) <= 1 and not re.search(r"[.!?]$", stripped):
             return True
 
         return False
@@ -863,9 +870,9 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 return
             else:
                 # Transcript looks complete — pass through immediately
-                logger.debug(
-                    f"TranscriptGracePeriod: transcript complete, passing through immediately: "
-                    f"{self._latest_transcript!r}"
+                logger.info(
+                    f"LATENCY | TranscriptGracePeriod: PASS-THROUGH (no grace)"
+                    f" — transcript={self._latest_transcript!r}"
                 )
                 # T0: VAD stop committed to LLM (no grace delay)
                 _latency.reset()
@@ -1257,6 +1264,12 @@ class ToolSoundSwitcherProcessor(FrameProcessor):
     Listens for:
       - FunctionCallsStartedFrame  → switch to keyboard_clicks
       - FunctionCallResultFrame    → switch back to office
+
+    The explicit push_frame(frame) at the bottom is required — super().process_frame()
+    only performs bookkeeping and does NOT forward frames downstream. Every frame
+    must be explicitly pushed, which is the standard Pipecat pattern.
+    The MixerUpdateSettingsFrame injections are *additional* frames inserted
+    before the original frame is forwarded.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -1275,7 +1288,7 @@ class ToolSoundSwitcherProcessor(FrameProcessor):
                 MixerUpdateSettingsFrame(settings={"sound": "office"}),
                 direction,
             )
-        
+
         await self.push_frame(frame, direction)
 
 
@@ -1292,6 +1305,7 @@ async def transfer_to_human_agent(params: FunctionCallParams):
     now = datetime.now()
 
     formatted_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    _t_dynamo = _time.monotonic()
     response = table.put_item(
         Item = {
             "contact_id": contact_id,
@@ -1299,6 +1313,7 @@ async def transfer_to_human_agent(params: FunctionCallParams):
             "timestamp" : formatted_timestamp
         }
     )
+    logger.info(f"LATENCY | transfer_to_human_agent DynamoDB put_item: {(_time.monotonic() - _t_dynamo)*1000:.0f}ms")
 
     # Upload the call recording before ending the task -- EndTaskFrame only
     # travels upstream from the LLM so it never reaches audio_recorder's
@@ -1319,6 +1334,7 @@ async def end_customer_call(params: FunctionCallParams):
     now = datetime.now()
 
     formatted_timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    _t_dynamo = _time.monotonic()
     response = table.put_item(
         Item = {
             "contact_id": contact_id,
@@ -1326,6 +1342,7 @@ async def end_customer_call(params: FunctionCallParams):
             "timestamp" : formatted_timestamp
         }
     )
+    logger.info(f"LATENCY | end_customer_call DynamoDB put_item: {(_time.monotonic() - _t_dynamo)*1000:.0f}ms")
     # Upload the call recording before ending the task -- EndTaskFrame only
     # travels upstream from the LLM so it never reaches audio_recorder's
     # cleanup(). Calling upload() directly is the reliable solution.
@@ -1350,6 +1367,7 @@ async def verify_user(params: FunctionCallParams):
     #The proper implementation needs to do fuzzy matching of the available information, and mention what information doesn't match.
     dynamodb = boto3.resource("dynamodb")
     table = dynamodb.Table("connect_users")
+    _t_dynamo = _time.monotonic()
     response = table.put_item(
         Item = {
             "contact_id": contact_id,
@@ -1360,6 +1378,7 @@ async def verify_user(params: FunctionCallParams):
             "email": email
         }
     )
+    logger.info(f"LATENCY | verify_user DynamoDB put_item: {(_time.monotonic() - _t_dynamo)*1000:.0f}ms")
 
     await asyncio.sleep(5)  # testing keyboard sound
     await params.result_callback({"user verified":"True"} )
@@ -1390,6 +1409,7 @@ def get_kvs_ice_servers():
     handles all signaling and media.
     """
     kvs = boto3.client("kinesisvideo", region_name=AWS_REGION)
+    _t_kvs = _time.monotonic()
 
     # Get or create signaling channel
     try:
@@ -1434,6 +1454,10 @@ def get_kvs_ice_servers():
             )
 
     logger.info(f"Retrieved {len(ice_servers)} TURN server(s) from KVS")
+    logger.info(
+        f"LATENCY | get_kvs_ice_servers total: {(_time.monotonic() - _t_kvs)*1000:.0f}ms"
+        f" | TURN URLs: {[u for s in ice_servers for u in s.urls]}"
+    )
     return ice_servers
 
 
@@ -1502,6 +1526,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             # model=os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5"),
         ),
     )
+    logger.info(
+        f"STARTUP | STT=ElevenLabsRealtime smart_turn=disabled"
+        f" | TTS=ElevenLabs voice={os.getenv('ELEVENLABS_VOICE_ID', '(unset)')!r}"
+        f" model={os.getenv('ELEVENLABS_MODEL_ID', '(default — eleven_multilingual_v2)')!r}"
+    )
 
 
     # Automatically uses credentials from assumed IAM role when running in
@@ -1515,6 +1544,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             # system_instruction="You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be spoken aloud, so avoid special characters that can't easily be spoken, such as emojis or bullet points. Respond to what the user said in a creative and helpful way.",
             system_instruction=system_instructions
         ),
+    )
+    logger.info(
+        f"STARTUP | LLM=AWSBedrock model=au.anthropic.claude-haiku-4-5-20251001-v1:0"
+        f" region={AWS_REGION!r} temperature=0.8"
     )
 
     llm.register_function("transfer_to_human_agent",transfer_to_human_agent ) 
@@ -1635,7 +1668,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         [
             transport.input(),
             stt,
-            TranscriptGracePeriodProcessor(grace_period_secs=1.2),
+            TranscriptGracePeriodProcessor(grace_period_secs=0.5),
             user_aggregator,
             llm,
             ToolSoundSwitcherProcessor(),
@@ -1712,9 +1745,11 @@ async def initialize_connection_and_run_bot(request: SmallWebRTCRequest):
     yield {"status": "initializing connection"}
     global request_handler
     request_handler = SmallWebRTCRequestHandler(ice_servers=ice_servers)
+    _t_offer = _time.monotonic()
     answer = await request_handler.handle_web_request(
         request=request, webrtc_connection_callback=webrtc_connection_callback
     )
+    logger.info(f"LATENCY | WebRTC offer→answer: {(_time.monotonic() - _t_offer)*1000:.0f}ms")
     yield {"status": "ANSWER:START"}
     yield {"answer": answer}
     yield {"status": "ANSWER:END"}
