@@ -77,6 +77,59 @@ from pipecat.audio.mixers.soundfile_mixer import SoundfileMixer
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 import asyncio
 import re
+import time as _time
+
+# ---------------------------------------------------------------------------
+# Latency instrumentation
+# ---------------------------------------------------------------------------
+# Each turn is tracked through the pipeline. Timestamps are taken at:
+#   T0  – UserStoppedSpeakingFrame exits TranscriptGracePeriodProcessor
+#         (i.e. VAD silence confirmed, turn committed to LLM)
+#   T1  – First LLMTextFrame exits StripInternalTagsProcessor
+#         (first real spoken token after <message> tag is stripped)
+#   T2  – TTSStartedFrame (TTS synthesis started)
+#   T3  – First OutputAudioRawFrame (first audio chunk sent to caller)
+#
+# All gaps are logged at INFO level as:
+#   LATENCY | vad_to_llm_first_token=Xms | llm_first_token_to_tts=Xms |
+#            tts_to_audio=Xms | total_vad_to_audio=Xms
+#
+# Set LOG_LEVEL=DEBUG to also see per-frame trace logs.
+# ---------------------------------------------------------------------------
+
+class LatencyTracker:
+    """Shared mutable state for one turn's latency measurements."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.t0_vad_stop:         float | None = None  # UserStoppedSpeaking committed
+        self.t1_llm_first_token:  float | None = None  # first LLMTextFrame out of StripTags
+        self.t2_tts_started:      float | None = None  # TTSStartedFrame
+        self.t3_first_audio:      float | None = None  # first OutputAudioRawFrame
+        self._reported:           bool = False
+
+    def report_if_complete(self):
+        if self._reported:
+            return
+        if not all([self.t0_vad_stop, self.t1_llm_first_token,
+                    self.t2_tts_started, self.t3_first_audio]):
+            return
+        self._reported = True
+        vad_to_first_token = (self.t1_llm_first_token - self.t0_vad_stop) * 1000
+        token_to_tts       = (self.t2_tts_started     - self.t1_llm_first_token) * 1000
+        tts_to_audio       = (self.t3_first_audio      - self.t2_tts_started) * 1000
+        total              = (self.t3_first_audio      - self.t0_vad_stop) * 1000
+        logger.info(
+            f"LATENCY | vad_to_llm_first_token={vad_to_first_token:.0f}ms"
+            f" | llm_token_to_tts_start={token_to_tts:.0f}ms"
+            f" | tts_start_to_first_audio={tts_to_audio:.0f}ms"
+            f" | total_vad_to_audio={total:.0f}ms"
+        )
+
+
+# Global tracker — reset at the start of each turn
+_latency = LatencyTracker()
 
 system_instructions="""
   You are a friendly but professional AI customer service agent for a lending company called Latrobe Financial. Latrobe financial provides loans to customers and your role is to verify the user, and ask how you can help them. You try to collect the information they provide and their concerns, and then will try to  help users with their questions and issues. However, your actual capabilities depend entirely on the tools available to you. Do not assume you can help with any specific request without first checking what tools you have access to. 
@@ -439,6 +492,13 @@ class StripInternalTagsProcessor(FrameProcessor):
         elif isinstance(frame, LLMTextFrame):
             cleaned = self._process_text(frame.text)
             if cleaned:
+                # T1: first real spoken token exits tag-stripping
+                if _latency.t0_vad_stop and not _latency.t1_llm_first_token:
+                    _latency.t1_llm_first_token = _time.monotonic()
+                    logger.debug(
+                        f"LATENCY | first LLM token to TTS: {((_latency.t1_llm_first_token - _latency.t0_vad_stop)*1000):.0f}ms"
+                        f" | token={cleaned!r}"
+                    )
                 await self.push_frame(LLMTextFrame(text=cleaned), direction)
             # If cleaned is empty, swallow the frame — don't push empty tokens
 
@@ -684,6 +744,7 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         self._latest_transcript: str = ""
         self._held_frame: Frame | None = None
         self._grace_task: asyncio.Task | None = None
+        self._bot_is_speaking: bool = False  # bypass grace when interrupting
 
     # ------------------------------------------------------------------
     # Transcript tracking — updated from TranscriptionFrame if available,
@@ -734,13 +795,17 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         try:
             await asyncio.sleep(self._grace_period_secs)
             # Grace period expired with no new speech — commit the turn
-            logger.debug(
-                f"TranscriptGracePeriod: grace expired, committing turn "
-                f"(transcript={self._latest_transcript!r})"
+            logger.info(
+                f"LATENCY | TranscriptGracePeriod: grace expired after {self._grace_period_secs}s,"
+                f" committing turn (transcript={self._latest_transcript!r})"
             )
+            # T0: VAD stop committed to LLM (after grace delay)
+            _latency.reset()
+            _latency.t0_vad_stop = _time.monotonic()
             self._held_frame = None
             await self.push_frame(frame, direction)
         except asyncio.CancelledError:
+            logger.debug("TranscriptGracePeriod: grace cancelled — user resumed speaking")
             pass  # user resumed speaking — frame was already discarded
 
     # ------------------------------------------------------------------
@@ -760,12 +825,34 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
         except ImportError:
             pass
 
+        # Track bot speaking state so we can bypass grace on interruption
+        if isinstance(frame, TTSStartedFrame):
+            self._bot_is_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_is_speaking = False
+
         if isinstance(frame, UserStoppedSpeakingFrame):
+            # If the bot is/was speaking when the user stopped, this is an
+            # interruption — commit the turn immediately without any grace delay
+            # so the pipeline cancels TTS and processes the interrupt ASAP.
+            if self._bot_is_speaking:
+                logger.info(
+                    f"LATENCY | TranscriptGracePeriod: INTERRUPTION detected"
+                    f" — bypassing grace period (transcript={self._latest_transcript!r})"
+                )
+                self._cancel_grace()
+                self._held_frame = None
+                self._bot_is_speaking = False
+                _latency.reset()
+                _latency.t0_vad_stop = _time.monotonic()
+                await self.push_frame(frame, direction)
+                return
+
             if self._looks_incomplete():
                 # Hold the frame and start the grace period
-                logger.debug(
-                    f"TranscriptGracePeriod: incomplete transcript detected "
-                    f"({self._latest_transcript!r}) — holding for {self._grace_period_secs}s"
+                logger.info(
+                    f"LATENCY | TranscriptGracePeriod: HOLDING turn for up to {self._grace_period_secs}s"
+                    f" — transcript looks incomplete: {self._latest_transcript!r}"
                 )
                 self._held_frame = frame
                 self._cancel_grace()
@@ -776,6 +863,13 @@ class TranscriptGracePeriodProcessor(FrameProcessor):
                 return
             else:
                 # Transcript looks complete — pass through immediately
+                logger.debug(
+                    f"TranscriptGracePeriod: transcript complete, passing through immediately: "
+                    f"{self._latest_transcript!r}"
+                )
+                # T0: VAD stop committed to LLM (no grace delay)
+                _latency.reset()
+                _latency.t0_vad_stop = _time.monotonic()
                 self._cancel_grace()
                 self._held_frame = None
 
@@ -897,11 +991,31 @@ class UserSilenceDetectorProcessor(FrameProcessor):
 
 class AudioRecorderProcessor(FrameProcessor):
     """
-    Taps both legs of the call and writes a stereo WAV to S3 when the
-    pipeline ends.
+    Taps both legs of the call and writes a time-aligned stereo WAV to S3.
 
     * Left channel  = caller (InputAudioRawFrame)
     * Right channel = bot    (OutputAudioRawFrame)
+
+    WHY TIME-ALIGNMENT IS NEEDED
+    -----------------------------
+    The bot does not speak immediately — its first OutputAudioRawFrame arrives
+    ~1-2s after the first InputAudioRawFrame (VAD + LLM + TTS latency). Without
+    alignment, both channels are concatenated from their respective t=0 and
+    interleaved assuming they started together, which shifts every bot utterance
+    ~1-2s earlier in the recording. The result sounds like the bot is talking
+    over the previous caller utterance — exactly the symptom reported.
+
+    FIX: record the wall-clock monotonic timestamp of the first frame on each
+    channel. At upload time, prepend silence to whichever channel started later
+    so both channels share the same time origin before interleaving.
+
+    Additionally, OutputAudioRawFrame is captured here before transport.output()
+    adds its own playback buffering, so the bot audio in the recording is
+    slightly ahead of what actually plays through the phone. A configurable
+    outbound compensation delay (RECORDING_OUT_DELAY_MS, default 200ms) shifts
+    the bot channel slightly later to account for WebRTC jitter buffer + RTP
+    packetization + PSTN network delay. Tune by ear: if the bot still sounds
+    early, increase it; if it sounds late, decrease it.
 
     Upload is triggered in one of two ways:
       1. upload() is called explicitly -- used by tool functions (transfer /
@@ -911,7 +1025,8 @@ class AudioRecorderProcessor(FrameProcessor):
 
     Environment variables
     ---------------------
-    RECORDINGS_S3_BUCKET  -- destination bucket name (required)
+    RECORDINGS_S3_BUCKET      -- destination bucket name (required)
+    RECORDING_OUT_DELAY_MS    -- extra ms to shift bot channel later (default 200)
     """
 
     _OUT_SAMPLE_RATE: int = 16_000
@@ -921,8 +1036,13 @@ class AudioRecorderProcessor(FrameProcessor):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._bucket: str = os.environ.get("RECORDINGS_S3_BUCKET", "")
-        self._in_buf: bytearray = bytearray()   # caller PCM (left channel)
-        self._out_buf: bytearray = bytearray()  # bot PCM    (right channel)
+        self._in_buf: bytearray = bytearray()    # caller PCM (left channel)
+        self._out_buf: bytearray = bytearray()   # bot PCM    (right channel)
+        self._in_start_ts: float | None = None   # monotonic time of first inbound frame
+        self._out_start_ts: float | None = None  # monotonic time of first outbound frame
+        # Extra compensation for transport/network delay between OutputAudioRawFrame
+        # and audio actually reaching the caller's ear (WebRTC + RTP + PSTN).
+        self._out_delay_ms: int = int(os.environ.get("RECORDING_OUT_DELAY_MS", "200"))
         self._started_at: str = ""
         self._uploaded: bool = False             # guard against double-upload
         if not self._bucket:
@@ -931,7 +1051,10 @@ class AudioRecorderProcessor(FrameProcessor):
                 "audio will be buffered but NOT uploaded."
             )
         else:
-            logger.info(f"AudioRecorderProcessor: will upload to s3://{self._bucket}/recordings/")
+            logger.info(
+                f"AudioRecorderProcessor: will upload to s3://{self._bucket}/recordings/"
+                f"  out_delay_compensation={self._out_delay_ms}ms"
+            )
 
     # ------------------------------------------------------------------
     # Frame handling
@@ -940,8 +1063,19 @@ class AudioRecorderProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
+        # Latency instrumentation
+        if isinstance(frame, TTSStartedFrame):
+            if _latency.t1_llm_first_token and not _latency.t2_tts_started:
+                _latency.t2_tts_started = _time.monotonic()
+                logger.debug(
+                    f"LATENCY | TTSStartedFrame: {((_latency.t2_tts_started - _latency.t1_llm_first_token)*1000):.0f}ms"
+                    " after first token"
+                )
+
         if isinstance(frame, InputAudioRawFrame):
-            if not self._started_at:
+            now = _time.monotonic()
+            if self._in_start_ts is None:
+                self._in_start_ts = now
                 self._started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 logger.debug(f"AudioRecorderProcessor: recording started ({self._started_at})")
             self._in_buf.extend(
@@ -949,9 +1083,20 @@ class AudioRecorderProcessor(FrameProcessor):
             )
 
         elif isinstance(frame, OutputAudioRawFrame):
-            if not self._started_at:
-                self._started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                logger.debug(f"AudioRecorderProcessor: recording started ({self._started_at})")
+            now = _time.monotonic()
+            if self._out_start_ts is None:
+                self._out_start_ts = now
+                if not self._started_at:
+                    self._started_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                logger.debug(
+                    f"AudioRecorderProcessor: first bot audio frame at "
+                    f"+{(now - self._in_start_ts)*1000:.0f}ms after caller start"
+                    if self._in_start_ts else
+                    "AudioRecorderProcessor: first bot audio frame (no inbound audio yet)"
+                )
+            if _latency.t2_tts_started and not _latency.t3_first_audio:
+                _latency.t3_first_audio = now
+                _latency.report_if_complete()
             self._out_buf.extend(
                 self._resample(frame.audio, frame.sample_rate, self._OUT_SAMPLE_RATE)
             )
@@ -1010,6 +1155,53 @@ class AudioRecorderProcessor(FrameProcessor):
         out = [samples[int(i * n_src / n_dst)] for i in range(n_dst)]
         return struct.pack(f"<{n_dst}h", *out)
 
+    def _silence(self, duration_ms: int) -> bytes:
+        """Generate silence PCM for a given duration at the output sample rate."""
+        n_samples = int(self._OUT_SAMPLE_RATE * duration_ms / 1000)
+        return b"\x00\x00" * n_samples
+
+    def _align_channels(self) -> tuple[bytes, bytes]:
+        """
+        Align both channels to a common time origin before interleaving.
+
+        1. Compute the offset between channel start times.
+        2. Prepend silence to whichever channel started later.
+        3. Add the outbound compensation delay to the bot channel to account
+           for transport/network latency between OutputAudioRawFrame and the
+           audio actually reaching the caller.
+
+        Returns (left_pcm, right_pcm) ready for interleaving.
+        """
+        left  = bytes(self._in_buf)   # caller
+        right = bytes(self._out_buf)  # bot
+
+        if self._in_start_ts is None or self._out_start_ts is None:
+            # One channel never started — return as-is
+            logger.warning("AudioRecorderProcessor: one channel has no data, skipping alignment")
+            return left, right
+
+        # Gap between channel starts in milliseconds
+        start_gap_ms = (self._out_start_ts - self._in_start_ts) * 1000
+
+        # Total shift for the bot channel = start gap + transport compensation
+        total_out_shift_ms = start_gap_ms + self._out_delay_ms
+
+        logger.info(
+            f"AudioRecorderProcessor: channel alignment — "
+            f"bot started {start_gap_ms:.0f}ms after caller, "
+            f"transport compensation={self._out_delay_ms}ms, "
+            f"total bot shift={total_out_shift_ms:.0f}ms"
+        )
+
+        if total_out_shift_ms > 0:
+            # Bot channel starts later — prepend silence to bot
+            right = self._silence(int(total_out_shift_ms)) + right
+        elif total_out_shift_ms < 0:
+            # Bot channel started before caller (shouldn't happen, but handle it)
+            left = self._silence(int(-total_out_shift_ms)) + left
+
+        return left, right
+
     def _interleave(self, left: bytes, right: bytes) -> bytes:
         """Interleave two mono 16-bit PCM buffers into one stereo buffer."""
         L = struct.unpack(f"<{len(left)  // 2}h", left)
@@ -1021,8 +1213,9 @@ class AudioRecorderProcessor(FrameProcessor):
         return struct.pack(f"<{len(stereo)}h", *stereo)
 
     def _build_wav(self) -> bytes:
-        """Build a complete in-memory stereo WAV file."""
-        pcm = self._interleave(bytes(self._in_buf), bytes(self._out_buf))
+        """Build a complete in-memory time-aligned stereo WAV file."""
+        left, right = self._align_channels()
+        pcm = self._interleave(left, right)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(self._OUT_CHANNELS)
@@ -1261,7 +1454,7 @@ transport_params = {
         #   pip install pipecat-ai[silero]  (pulls in soxr as a dependency)
         # If soxr is missing, RNNoise silently disables itself and audio passes
         # through unfiltered — check logs for "Could not import SOXRStreamAudioResampler".
-        audio_in_filter=RNNoiseFilter(resampler_quality="MQ"),
+        # audio_in_filter=RNNoiseFilter(resampler_quality="HQ"),
         audio_out_enabled=True,
         audio_out_mixer=mixer
     ),
@@ -1303,8 +1496,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
         settings=ElevenLabsTTSService.Settings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
-            # model = os.getenv("ELEVENLABS_MODEL_ID","eleven_v3"),
-            
+            # # eleven_turbo_v2_5 has ~50% lower latency than eleven_multilingual_v2
+            # # at the cost of slightly reduced expressiveness. Good default for telephony.
+            # # Override with ELEVENLABS_MODEL_ID=eleven_multilingual_v2 for more expression.
+            # model=os.getenv("ELEVENLABS_MODEL_ID", "eleven_turbo_v2_5"),
         ),
     )
 
@@ -1409,20 +1604,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context,
         user_params=LLMUserAggregatorParams(
             # Tuned for telephony-grade audio.
-            # - stop_secs: 0.8s of silence required before the turn closes.
-            #   The Silero default (~0.3s) is too aggressive for callers who
-            #   pause mid-thought; 0.8s gives natural speech room to breathe
-            #   without adding noticeable latency for prompt speakers.
+            # - stop_secs: silence required before the turn closes and LLM fires.
+            #   0.6s is a good balance — faster response than 0.8s while still
+            #   giving callers a natural pause. Reduce to 0.4s if callers speak
+            #   in short complete sentences; increase to 1.0s if you see
+            #   premature cut-offs on hesitant callers.
             # - start_secs: 0.2s of speech required before VAD transitions to
             #   SPEAKING state, reducing false triggers from background noise.
             vad_analyzer=SileroVADAnalyzer(
                 params=VADParams(
-                    stop_secs=0.8,
+                    stop_secs=0.6,
                     start_secs=0.2,
                 )
             ),
         ),
     )
+    logger.info("VAD config: stop_secs=0.6  start_secs=0.2")
 
     
     global audio_recorder

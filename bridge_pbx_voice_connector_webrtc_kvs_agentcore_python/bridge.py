@@ -1875,8 +1875,16 @@ class PbxBridge:
             stop.set()
             return
 
+        # Clear any stale epoll entry on this fd before registering.
+        # If a previous socket with the same fd number was closed without
+        # remove_reader being called first, epoll retains a broken entry that
+        # silently prevents new add_reader callbacks from firing on the reused fd.
+        try:
+            loop.remove_reader(sock.fileno())
+        except Exception:
+            pass
         loop.add_reader(sock.fileno(), _readable)
-        log.info("RTP->WebRTC started  call-id=%.36s", session.call_id)
+        log.info("RTP->WebRTC started  fd=%d  call-id=%.36s", sock.fileno(), session.call_id)
         no_rtp_warned = False
 
         try:
@@ -1957,6 +1965,7 @@ class PbxBridge:
                 fd = sock.fileno()
                 if fd != -1:
                     loop.remove_reader(fd)
+                    log.debug("RTP->WebRTC: remove_reader fd=%d  call-id=%.36s", fd, session.call_id)
             except Exception:
                 pass
             log.info("RTP->WebRTC ended  call-id=%.36s  rtp_rx=%d",
@@ -2443,6 +2452,17 @@ class PbxBridge:
             except Exception:
                 pass
         try:
+            # CRITICAL: remove_reader BEFORE close(). If close() runs first,
+            # the fd becomes invalid (-1). The next socket allocation may reuse
+            # that fd number, and add_reader() on the new fd will fail silently
+            # because epoll has a broken/stale entry for it. Always remove first.
+            try:
+                fd = session.rtp_socket.fileno()
+                if fd != -1:
+                    loop = asyncio.get_event_loop()
+                    loop.remove_reader(fd)
+            except Exception:
+                pass
             session.rtp_socket.close()
         except Exception:
             pass
